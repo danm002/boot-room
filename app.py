@@ -299,18 +299,19 @@ if value_bets:
     st.success(f"Best value found: **{LABELS[best_key]}** — edge {best_data[2]*100:+.1f}% at odds {best_data[0]:.2f}")
 
 st.divider()
-if st.button("Log this analysis", type="primary"):
-    logged, skipped = 0, 0
-    dest = "airtable"
-    for key, label in ALL_MARKET_KEYS:
-        match = next((r for r in results if r[3] == label), None)
-        if match:
-            dest = log_row(*match)
-            logged += 1
-        else:
-            dest = log_row(fixture, xg_liv, xg_opp, label, model[key], None, "skipped")
-            skipped += 1
-    where = "your Airtable base" if dest == "airtable" else f"the local file `{LOG_FILE}`"
-    st.success(f"Logged {logged} priced market(s) and {skipped} skipped to {where}.")
+st.subheader("Copy this week's summary")
+
+if results:
+    lines = ["\t".join(SUMMARY_HEADER)]
+    for r in results:
+        row = build_row(*r)
+        lines.append("\t".join(str(v) for v in row))
+    summary_text = "\n".join(lines)
+
+    st.caption("Click the copy icon in the top-right of the box below, then paste straight into Excel, "
+               "Google Sheets, or Notes — tab-separated, so it lands in the right columns automatically.")
+    st.code(summary_text, language=None)
+else:
+    st.caption("Enter at least one price above and it'll appear here, ready to copy.")
 
 st.caption("This models likely outcomes from expected-goals/cards inputs — it's not a prediction, and no model beats a well-priced market consistently. Bet only what you can afford to lose.")
