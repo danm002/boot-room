@@ -9,7 +9,6 @@ On Streamlit Community Cloud: add FOOTBALL_DATA_KEY under app Settings > Secrets
 """
 
 import os
-import csv
 import math
 from datetime import datetime
 
@@ -24,7 +23,8 @@ except Exception:
 BASE_URL = "https://api.football-data.org/v4"
 LIVERPOOL_ID = 64
 RECENT_MATCHES_N = 6
-LOG_FILE = "value_bet_log.csv"
+SUMMARY_HEADER = ["date", "opponent", "venue", "xg_liv", "xg_opp",
+                   "market", "model_prob", "odds", "implied_prob", "edge", "verdict"]
 
 MARKETS = [
     ("home", "Liverpool Win"),
@@ -116,19 +116,13 @@ def verdict(edge):
     return "marginal"
 
 
-def log_row(fixture, xg_liv, xg_opp, market_label, model_p, odds, verdict_str):
-    file_exists = os.path.exists(LOG_FILE)
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow(["date_logged", "opponent", "venue", "xg_liv", "xg_opp",
-                              "market", "model_prob", "odds", "implied_prob", "edge", "verdict"])
-        implied = 1 / odds if odds else ""
-        edge = (model_p - implied) if odds else ""
-        writer.writerow([datetime.now().isoformat(timespec="seconds"), fixture["opponent"],
-                          fixture["venue"], xg_liv, xg_opp, market_label, f"{model_p:.4f}",
-                          odds or "", f"{implied:.4f}" if odds else "", f"{edge:.4f}" if odds else "",
-                          verdict_str])
+def build_row(fixture, xg_liv, xg_opp, market_label, model_p, odds, verdict_str):
+    implied = 1 / odds if odds else ""
+    edge = (model_p - implied) if odds else ""
+    return [datetime.now().strftime("%Y-%m-%d"), fixture["opponent"],
+            fixture["venue"], xg_liv, xg_opp, market_label, f"{model_p:.4f}",
+            odds or "", f"{implied:.4f}" if odds else "", f"{edge:.4f}" if odds else "",
+            verdict_str]
 
 MARKET_GROUPS = [
     ("Match Result", "🥅", ["home", "draw", "away"]),
@@ -200,10 +194,8 @@ with st.sidebar:
         "1. Open your bookmarked app URL\n"
         "2. Check the fixture and estimated goals\n"
         "3. Enter this week's odds\n"
-        "4. Click **Log this analysis**"
+        "4. Copy the summary and paste it into your own spreadsheet"
     )
-    st.divider()
-    st.caption(f"Heads up: on the hosted version, `{LOG_FILE}` may not survive a redeploy or restart — treat any logged history here as short-term, or ask Claude about switching logging to Google Sheets for something durable.")
 
 if not API_KEY:
     st.error("FOOTBALL_DATA_KEY isn't set. Add it under app Settings > Secrets (hosted) or as an environment variable (local).")
@@ -307,16 +299,18 @@ if value_bets:
     st.success(f"Best value found: **{LABELS[best_key]}** — edge {best_data[2]*100:+.1f}% at odds {best_data[0]:.2f}")
 
 st.divider()
-if st.button("Log this analysis to CSV", type="primary"):
+if st.button("Log this analysis", type="primary"):
     logged, skipped = 0, 0
+    dest = "airtable"
     for key, label in ALL_MARKET_KEYS:
         match = next((r for r in results if r[3] == label), None)
         if match:
-            log_row(*match)
+            dest = log_row(*match)
             logged += 1
         else:
-            log_row(fixture, xg_liv, xg_opp, label, model[key], None, "skipped")
+            dest = log_row(fixture, xg_liv, xg_opp, label, model[key], None, "skipped")
             skipped += 1
-    st.success(f"Logged {logged} priced market(s) and {skipped} skipped to {LOG_FILE}.")
+    where = "your Airtable base" if dest == "airtable" else f"the local file `{LOG_FILE}`"
+    st.success(f"Logged {logged} priced market(s) and {skipped} skipped to {where}.")
 
 st.caption("This models likely outcomes from expected-goals/cards inputs — it's not a prediction, and no model beats a well-priced market consistently. Bet only what you can afford to lose.")
