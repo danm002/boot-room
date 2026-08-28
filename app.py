@@ -131,11 +131,23 @@ def log_row(fixture, xg_liv, xg_opp, market_label, model_p, odds, verdict_str):
                           verdict_str])
 
 MARKET_GROUPS = [
-    ("Match Result", ["home", "draw", "away"]),
-    ("Goals", ["over25", "under25"]),
-    ("Both Teams to Score", ["bttsY", "bttsN"]),
+    ("Match Result", "🥅", ["home", "draw", "away"]),
+    ("Goals", "⚽", ["over25", "under25"]),
+    ("Both Teams to Score", "🎯", ["bttsY", "bttsN"]),
+    ("Discipline", "🟨", ["cardsOver", "cardsUnder"]),
 ]
 LABELS = dict(MARKETS)
+
+CARDS_THRESHOLD = 3.5
+LABELS["cardsOver"] = f"Over {CARDS_THRESHOLD} Match Cards"
+LABELS["cardsUnder"] = f"Under {CARDS_THRESHOLD} Match Cards"
+ALL_MARKET_KEYS = MARKETS + [("cardsOver", LABELS["cardsOver"]), ("cardsUnder", LABELS["cardsUnder"])]
+
+
+def cards_over_under(lam, threshold=CARDS_THRESHOLD):
+    floor_t = int(math.floor(threshold))
+    under = sum(poisson_pmf(lam, k) for k in range(floor_t + 1))
+    return 1 - under, under
 
 # ---------- page ----------
 
@@ -143,41 +155,58 @@ st.set_page_config(page_title="The Boot Room", page_icon="⚽", layout="centered
 
 st.markdown("""
 <style>
+    @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;700&display=swap');
+
     .stApp { background-color: #0C0F0A; }
+    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+
+    .hero {
+        background: linear-gradient(135deg, #1A0508 0%, #0C0F0A 70%);
+        border: 1px solid #2A332A; border-left: 4px solid #C8102E;
+        border-radius: 10px; padding: 22px 24px; margin-bottom: 18px;
+    }
+    .hero-title {
+        font-family: 'Bebas Neue', sans-serif; font-size: 40px; letter-spacing: 1px;
+        color: #EDEDE6; line-height: 1;
+    }
+    .hero-title span { color: #C8102E; }
+    .hero-sub { color: #8B948A; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 6px; }
+    .hero-fixture { font-family: 'Bebas Neue', sans-serif; font-size: 26px; color: #E8B33D; margin-top: 14px; letter-spacing: 0.4px; }
+    .hero-meta { color: #8B948A; font-size: 13px; margin-top: 2px; }
+
     .badge {
-        display:inline-block; padding:3px 10px; border-radius:12px;
-        font-size:12px; font-weight:700; letter-spacing:0.03em;
+        display:inline-block; padding:4px 11px; border-radius:12px;
+        font-size:12px; font-weight:700; letter-spacing:0.03em; font-family:'IBM Plex Mono',monospace;
     }
     .badge-value { background:rgba(76,175,125,0.18); color:#4CAF7D; }
     .badge-avoid { background:rgba(193,99,63,0.18); color:#C1633F; }
     .badge-marginal { background:rgba(139,148,138,0.18); color:#8B948A; }
+
     .market-card {
         background:#171B14; border:1px solid #2A332A; border-radius:8px;
-        padding:12px 16px; margin-bottom:8px;
+        padding:12px 16px; margin-bottom:8px; transition: border-color 0.15s;
     }
-    .market-name { font-weight:600; font-size:14px; }
-    .model-pct { color:#8B948A; font-size:12px; }
+    .market-name { font-weight:600; font-size:14px; color:#EDEDE6; }
+    .model-pct { color:#8B948A; font-size:12px; font-family:'IBM Plex Mono',monospace; }
+
+    .stTabs [data-baseweb="tab"] { font-weight: 600; }
+    div[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; color: #E8B33D; }
 </style>
 """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### Weekly routine")
     st.markdown(
-        "1. Open PowerShell\n"
-        "2. Set your API key\n"
-        "3. `cd` into betting-tool\n"
-        "4. `python -m streamlit run app.py`\n"
-        "5. Enter this week's odds\n"
-        "6. Click **Log this analysis**"
+        "1. Open your bookmarked app URL\n"
+        "2. Check the fixture and estimated goals\n"
+        "3. Enter this week's odds\n"
+        "4. Click **Log this analysis**"
     )
     st.divider()
-    st.caption(f"Results are appended to `{LOG_FILE}` in this folder — open it in Excel any time to review your history.")
-
-st.title("⚽ The Boot Room")
-st.caption("Liverpool value-bet model — expected goals vs. the odds")
+    st.caption(f"Heads up: on the hosted version, `{LOG_FILE}` may not survive a redeploy or restart — treat any logged history here as short-term, or ask Claude about switching logging to Google Sheets for something durable.")
 
 if not API_KEY:
-    st.error("FOOTBALL_DATA_KEY isn't set. Close this, set it in your terminal the same way as before, then run `python -m streamlit run app.py` again.")
+    st.error("FOOTBALL_DATA_KEY isn't set. Add it under app Settings > Secrets (hosted) or as an environment variable (local).")
     st.stop()
 
 fixture = get_next_fixture(LIVERPOOL_ID)
@@ -187,8 +216,24 @@ if not fixture:
 
 kickoff_dt = datetime.fromisoformat(fixture["kickoff"].replace("Z", "+00:00"))
 venue_word = "vs" if fixture["venue"] == "H" else "at"
-st.subheader(f"Liverpool {venue_word} {fixture['opponent']}")
-st.write(f"{fixture['competition']} · {kickoff_dt.strftime('%a %d %b, %H:%M UTC')}")
+now_utc = datetime.now(kickoff_dt.tzinfo)
+delta = kickoff_dt - now_utc
+days_to_ko = max(delta.days, 0)
+hours_to_ko = max(delta.seconds // 3600, 0) if delta.total_seconds() > 0 else 0
+
+st.markdown(f"""
+<div class="hero">
+    <div class="hero-title">The Boot <span>Room</span></div>
+    <div class="hero-sub">Liverpool value-bet model &middot; expected goals vs. the odds</div>
+    <div class="hero-fixture">Liverpool {venue_word} {fixture['opponent']}</div>
+    <div class="hero-meta">{fixture['competition']} &middot; {kickoff_dt.strftime('%a %d %b, %H:%M UTC')}</div>
+</div>
+""", unsafe_allow_html=True)
+
+if delta.total_seconds() > 0:
+    c1, c2 = st.columns(2)
+    c1.metric("Days to kickoff", days_to_ko)
+    c2.metric("Hours (remainder)", hours_to_ko)
 
 liv_scored, liv_conceded = recent_scoring_form(LIVERPOOL_ID)
 opp_scored, opp_conceded = recent_scoring_form(fixture["opponent_id"])
@@ -198,7 +243,7 @@ if fixture["venue"] == "H":
 else:
     xg_opp, xg_liv = estimate_match_xg(opp_scored, opp_conceded, liv_scored, liv_conceded)
 
-with st.expander("Estimated goals (auto-calculated — click to adjust)", expanded=False):
+with st.expander("⚽ Estimated goals (auto-calculated — click to adjust)", expanded=False):
     col1, col2 = st.columns(2)
     xg_liv = col1.number_input("Liverpool est. goals", min_value=0.0, max_value=6.0,
                                 value=float(xg_liv), step=0.05, key="xg_liv_input")
@@ -206,7 +251,17 @@ with st.expander("Estimated goals (auto-calculated — click to adjust)", expand
                                 value=float(xg_opp), step=0.05, key="xg_opp_input")
     st.caption("Scoring-form proxy, not true xG — adjust if you know about an injury or other team news.")
 
+with st.expander("🟨 Match cards estimate (click to adjust)", expanded=False):
+    cards_lambda = st.number_input(
+        "Expected total match cards", min_value=0.0, max_value=10.0, value=4.0, step=0.25, key="cards_lambda_input"
+    )
+    st.caption("No reliable free data source for this, so it's manual — set it based on the referee's average "
+               "cards/game and how feisty this fixture tends to be. Premier League matches typically run 3\u20135.")
+
 model = compute_model(xg_liv, xg_opp)
+cards_over, cards_under = cards_over_under(cards_lambda)
+model["cardsOver"] = cards_over
+model["cardsUnder"] = cards_under
 
 st.divider()
 st.subheader("Odds & edge")
@@ -215,33 +270,36 @@ st.caption("Enter the price for any market — fractions like 5/2, or decimals l
 results = []
 odds_by_key = {}
 
-for group_name, keys in MARKET_GROUPS:
-    st.markdown(f"**{group_name}**")
-    for key in keys:
-        label = LABELS[key]
-        c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
-        c1.markdown(f'<div class="market-card"><span class="market-name">{label}</span><br>'
-                     f'<span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
-        odds_str = c2.text_input(f"{label} odds", key=f"odds_{key}", label_visibility="collapsed", placeholder="2.10 or 5/2")
-        badge_html = '<span class="badge badge-marginal">—</span>'
-        if odds_str:
-            try:
-                odds_str = odds_str.strip()
-                if "/" in odds_str:
-                    num, den = odds_str.split("/")
-                    odds = (float(num) / float(den)) + 1
-                else:
-                    odds = float(odds_str)
-                implied = 1 / odds
-                edge = model[key] - implied
-                v = verdict(edge)
-                cls = {"VALUE": "badge-value", "AVOID": "badge-avoid", "marginal": "badge-marginal"}[v]
-                badge_html = f'<span class="badge {cls}">{edge*100:+.1f}% · {v}</span>'
-                results.append((fixture, xg_liv, xg_opp, label, model[key], odds, v))
-                odds_by_key[key] = (odds, implied, edge, v)
-            except ValueError:
-                pass
-        c3.markdown(f'<div style="padding-top:10px">{badge_html}</div>', unsafe_allow_html=True)
+tab_labels = [f"{icon} {name}" for name, icon, _ in MARKET_GROUPS]
+tabs = st.tabs(tab_labels)
+
+for tab, (group_name, icon, keys) in zip(tabs, MARKET_GROUPS):
+    with tab:
+        for key in keys:
+            label = LABELS[key]
+            c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
+            c1.markdown(f'<div class="market-card"><span class="market-name">{label}</span><br>'
+                         f'<span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
+            odds_str = c2.text_input(f"{label} odds", key=f"odds_{key}", label_visibility="collapsed", placeholder="2.10 or 5/2")
+            badge_html = '<span class="badge badge-marginal">—</span>'
+            if odds_str:
+                try:
+                    odds_str = odds_str.strip()
+                    if "/" in odds_str:
+                        num, den = odds_str.split("/")
+                        odds = (float(num) / float(den)) + 1
+                    else:
+                        odds = float(odds_str)
+                    implied = 1 / odds
+                    edge = model[key] - implied
+                    v = verdict(edge)
+                    cls = {"VALUE": "badge-value", "AVOID": "badge-avoid", "marginal": "badge-marginal"}[v]
+                    badge_html = f'<span class="badge {cls}">{edge*100:+.1f}% · {v}</span>'
+                    results.append((fixture, xg_liv, xg_opp, label, model[key], odds, v))
+                    odds_by_key[key] = (odds, implied, edge, v)
+                except ValueError:
+                    pass
+            c3.markdown(f'<div style="padding-top:10px">{badge_html}</div>', unsafe_allow_html=True)
 
 value_bets = [(k, data) for k, data in odds_by_key.items() if data[3] == "VALUE"]
 if value_bets:
@@ -251,7 +309,7 @@ if value_bets:
 st.divider()
 if st.button("Log this analysis to CSV", type="primary"):
     logged, skipped = 0, 0
-    for key, label in MARKETS:
+    for key, label in ALL_MARKET_KEYS:
         match = next((r for r in results if r[3] == label), None)
         if match:
             log_row(*match)
@@ -261,4 +319,4 @@ if st.button("Log this analysis to CSV", type="primary"):
             skipped += 1
     st.success(f"Logged {logged} priced market(s) and {skipped} skipped to {LOG_FILE}.")
 
-st.caption("This models likely outcomes from expected-goals inputs — it's not a prediction, and no model beats a well-priced market consistently. Bet only what you can afford to lose.")
+st.caption("This models likely outcomes from expected-goals/cards inputs — it's not a prediction, and no model beats a well-priced market consistently. Bet only what you can afford to lose.")
