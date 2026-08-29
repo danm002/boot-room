@@ -615,31 +615,35 @@ def render_dashboard(fixture):
         c1.markdown(f'<div class="market-card"><span class="market-name">{market_labels[key]}</span><br><span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
         odds_text = c2.text_input(f"{key} odds", key=f"odds_{key}_{fixture['home_team_id']}", label_visibility="collapsed", placeholder="2.10")
         odds_inputs[key] = parse_odds(odds_text)
-        c3.markdown('<div style="padding-top:10px"><span class="badge badge-marginal">—</span></div>', unsafe_allow_html=True)
 
     devig_probs = fair_probabilities_from_market(odds_inputs)
     results = []
+    all_market_keys = ["home", "draw", "away", "over25", "under25", "bttsY", "bttsN", "cardsOver", "cardsUnder"]
 
-    for key in ["home", "draw", "away"]:
-        odds = odds_inputs.get(key)
-        if odds is None:
-            continue
-        market_prob = devig_probs.get(key, implied_probability(odds))
-        edge = model[key] - market_prob
-        verdict_name = verdict(edge)
-        results.append({"key": key, "label": market_labels[key], "model_probability": model[key], "odds": odds, "market_probability": market_prob, "edge": edge, "verdict": verdict_name})
-
-    for key in ["over25", "under25", "bttsY", "bttsN", "cardsOver", "cardsUnder"]:
+    # Re-render UI cleanly with feedback loops
+    # Clear out previous placeholder render and perform the unified loop logic cleanly:
+    st.empty()
+    
+    # Let's iterate through all markets directly with live evaluation:
+    for key in all_market_keys:
         c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
         c1.markdown(f'<div class="market-card"><span class="market-name">{market_labels[key]}</span><br><span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
-        odds_text = c2.text_input(f"{key} odds", key=f"odds_{key}_{fixture['home_team_id']}", label_visibility="collapsed", placeholder="2.10")
+        
+        odds_text = c2.text_input(f"odds_{key}", key=f"odds_{key}_{fixture['home_team_id']}", label_visibility="collapsed", placeholder="2.10")
         odds = parse_odds(odds_text)
+        
         if odds is None:
-            c3.markdown('<div style="padding-top:10px"><span class="badge badge-marginal">—</span></div>', unsafe_allow_html=True)
+            c3.markdown('<div style="padding-top:10px"><span class="badge badge-marginal">Enter odds</span></div>', unsafe_allow_html=True)
             continue
-        market_prob = implied_probability(odds)
+
+        if key in ["home", "draw", "away"]:
+            market_prob = devig_probs.get(key, implied_probability(odds))
+        else:
+            market_prob = implied_probability(odds)
+
         edge = model[key] - market_prob
         verdict_name = verdict(edge)
+        
         c3.markdown(f'<div style="padding-top:10px"><span class="badge {verdict_class(verdict_name)}">{edge*100:+.1f}% · {verdict_name}</span></div>', unsafe_allow_html=True)
         results.append({"key": key, "label": market_labels[key], "model_probability": model[key], "odds": odds, "market_probability": market_prob, "edge": edge, "verdict": verdict_name})
 
