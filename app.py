@@ -1,64 +1,20 @@
 """
-The Boot Room — browser UI version.
+THE BOOT ROOM
+A football match probability and value-bet analysis dashboard.
 
-Run locally with:
+Run locally:
+    pip install streamlit requests
     python -m streamlit run app.py
 
-Install:
-    pip install streamlit requests
+Environment variable:
+    FOOTBALL_DATA_KEY=your_api_key
 
-Locally:
-    set FOOTBALL_DATA_KEY as an environment variable.
+Or Streamlit secrets:
+    FOOTBALL_DATA_KEY = "your_api_key"
 
-Streamlit Community Cloud:
-    Add FOOTBALL_DATA_KEY under App Settings > Secrets.
-
-============================================================
-MODEL
-============================================================
-
-The goal model is deliberately transparent rather than pretending
-to be a sophisticated commercial xG model.
-
-It combines:
-
-1. League-relative attacking strength
-2. League-relative defensive strength
-3. Home/away context
-4. Recent form
-5. Longer-term form
-6. League home advantage
-7. Independent Poisson goal distributions
-
-The model does NOT use provider xG because the current free data
-source does not provide the required xG dataset.
-
-The result should therefore be thought of as:
-
-    "modelled expected goals"
-
-rather than:
-
-    "true xG"
-
-Cards remain a manually supplied Poisson estimate.
-
-============================================================
-RELIABILITY NOTE
-============================================================
-
-api_get() never halts the app on a failed request — it returns
-None and lets each caller decide what to do. Non-critical data
-(league standings) falls back to sane defaults; only a missing
-fixture (nothing to show at all) stops the page.
-
-============================================================
+Important:
+This is a probability model, not a prediction engine or guaranteed betting system.
 """
-
-
-# ============================================================
-# IMPORTS
-# ============================================================
 
 import os
 import math
@@ -72,40 +28,67 @@ import streamlit as st
 # CONFIG
 # ============================================================
 
+st.set_page_config(
+    page_title="The Boot Room",
+    page_icon="⚽",
+    layout="wide",
+)
+
 BASE_URL = "https://api.football-data.org/v4"
 
 LIVERPOOL_ID = 64
 
 RECENT_MATCHES_N = 6
-LONG_TERM_MATCHES_N = 30
+LONG_TERM_MATCHES_N = 20
 
-RECENT_WEIGHT = 0.35
-LONG_TERM_WEIGHT = 0.65
+# Regression strength:
+# Higher values = more conservative estimates.
+REGRESSION_MATCHES = 8
 
-VENUE_WEIGHT = 0.30
-
-TEAM_STRENGTH_WEIGHT = 0.75
-LEAGUE_MEAN_WEIGHT = 0.25
+HOME_ADVANTAGE_FALLBACK = 1.08
 
 MAX_GOALS = 12
 
-VALUE_EDGE_THRESHOLD = 0.05
-
 CARDS_THRESHOLD = 3.5
-DEFAULT_CARDS_LAMBDA = 4.0
 
-REQUEST_TIMEOUT = 10
+SUMMARY_HEADER = [
+    "date",
+    "competition",
+    "home_team",
+    "away_team",
+    "kickoff_utc",
+    "home_xg",
+    "away_xg",
+    "market",
+    "model_probability",
+    "odds",
+    "market_probability",
+    "edge",
+    "verdict",
+]
 
-
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-
-st.set_page_config(
-    page_title="The Boot Room",
-    page_icon="⚽",
-    layout="centered",
-)
+MARKET_GROUPS = [
+    (
+        "Match Result",
+        "🥅",
+        ["home", "draw", "away"],
+    ),
+    (
+        "Goals",
+        "⚽",
+        ["over25", "under25"],
+    ),
+    (
+        "Both Teams to Score",
+        "🎯",
+        ["bttsY", "bttsN"],
+    ),
+    (
+        "Discipline",
+        "🟨",
+        ["cardsOver", "cardsUnder"],
+    ),
+]
 
 
 # ============================================================
@@ -119,40 +102,1307 @@ except Exception:
 
 
 # ============================================================
-# MARKET DEFINITIONS
+# API
 # ============================================================
 
-MARKETS = [
-    ("home", "Liverpool Win"),
-    ("draw", "Draw"),
-    ("away", "Opponent Win"),
-    ("over25", "Over 2.5 Goals"),
-    ("under25", "Under 2.5 Goals"),
-    ("bttsY", "BTTS - Yes"),
-    ("bttsN", "BTTS - No"),
-]
+def api_get(path, params=None):
+    """
+    Generic football-data.org GET request.
+    """
 
-MARKET_GROUPS = [
-    ("Match Result", "🥅", ["home", "draw", "away"]),
-    ("Goals", "⚽", ["over25", "under25"]),
-    ("Both Teams to Score", "🎯", ["bttsY", "bttsN"]),
-    ("Discipline", "🟨", ["cardsOver", "cardsUnder"]),
-]
+    if not API_KEY:
+        raise RuntimeError(
+            "FOOTBALL_DATA_KEY is not configured."
+        )
 
-LABELS = dict(MARKETS)
-LABELS["cardsOver"] = f"Over {CARDS_THRESHOLD:g} Match Cards"
-LABELS["cardsUnder"] = f"Under {CARDS_THRESHOLD:g} Match Cards"
+    headers = {
+        "X-Auth-Token": API_KEY,
+    }
 
-ALL_MARKET_KEYS = list(LABELS.keys())
+    try:
+        response = requests.get(
+            f"{BASE_URL}{path}",
+            headers=headers,
+            params=params or {},
+            timeout=20,
+        )
 
-# Kept at 11 columns, same order as the original tracker spreadsheet expects.
-# (fair_market_prob still improves the edge calc internally — it's just not
-# added as a 12th column here, so pasting into the existing tracker doesn't
-# shift verdict/actual_result/stake/profit out of alignment.)
-SUMMARY_HEADER = [
-    "date", "opponent", "venue", "xg_liv", "xg_opp",
-    "market", "model_prob", "odds", "implied_prob", "edge", "verdict",
-]
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.Timeout:
+        raise RuntimeError(
+            "The football data API timed out. Please try again."
+        )
+
+    except requests.exceptions.HTTPError as exc:
+
+        status = exc.response.status_code
+
+        if status == 401:
+            raise RuntimeError(
+                "Your FOOTBALL_DATA_KEY was rejected by the API."
+            )
+
+        if status == 403:
+            raise RuntimeError(
+                "Your football-data.org API plan does not appear to have access "
+                "to this competition or endpoint."
+            )
+
+        if status == 429:
+            raise RuntimeError(
+                "The football data API rate limit has been reached. "
+                "Please wait and try again."
+            )
+
+        raise RuntimeError(
+            f"Football API error ({status})."
+        )
+
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"Could not connect to the football API: {exc}"
+        )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_datetime(value):
+    """
+    Convert API UTC timestamp into timezone-aware datetime.
+    """
+
+    if not value:
+        return None
+
+    return datetime.fromisoformat(
+        value.replace("Z", "+00:00")
+    )
+
+
+def weighted_average(values, weights=None):
+    if not values:
+        return None
+
+    if weights is None:
+        return sum(values) / len(values)
+
+    total_weight = sum(weights)
+
+    if total_weight == 0:
+        return None
+
+    return sum(
+        value * weight
+        for value, weight in zip(values, weights)
+    ) / total_weight
+
+
+def poisson_pmf(lam, k):
+    """
+    Poisson probability mass function.
+    """
+
+    if lam < 0:
+        return 0.0
+
+    return (
+        math.exp(-lam)
+        * (lam ** k)
+        / math.factorial(k)
+    )
+
+
+def verdict(edge):
+    """
+    Conservative edge classification.
+    """
+
+    if edge >= 0.05:
+        return "VALUE"
+
+    if edge <= -0.03:
+        return "AVOID"
+
+    return "MARGINAL"
+
+
+def verdict_class(verdict_name):
+    return {
+        "VALUE": "badge-value",
+        "AVOID": "badge-avoid",
+        "MARGINAL": "badge-marginal",
+    }.get(
+        verdict_name,
+        "badge-marginal",
+    )
+
+
+# ============================================================
+# ODDS
+# ============================================================
+
+def parse_odds(value):
+    """
+    Supports:
+        2.10
+        5/2
+
+    Returns decimal odds.
+    """
+
+    if value is None:
+        return None
+
+    value = str(value).strip()
+
+    if not value:
+        return None
+
+    try:
+
+        if "/" in value:
+
+            parts = value.split("/")
+
+            if len(parts) != 2:
+                return None
+
+            numerator = float(parts[0].strip())
+            denominator = float(parts[1].strip())
+
+            if denominator <= 0:
+                return None
+
+            decimal_odds = (
+                numerator / denominator
+            ) + 1
+
+        else:
+
+            decimal_odds = float(value)
+
+        if decimal_odds <= 1:
+            return None
+
+        return decimal_odds
+
+    except (ValueError, TypeError):
+        return None
+
+
+def implied_probability(odds):
+    if odds is None or odds <= 1:
+        return None
+
+    return 1 / odds
+
+
+def fair_probabilities_from_market(odds_map):
+    """
+    Removes bookmaker margin from a complete 1X2 market.
+
+    odds_map:
+        {
+            "home": 2.10,
+            "draw": 3.60,
+            "away": 3.40
+        }
+    """
+
+    required = ["home", "draw", "away"]
+
+    if not all(
+        odds_map.get(key)
+        for key in required
+    ):
+        return {}
+
+    raw_probs = {
+        key: 1 / odds_map[key]
+        for key in required
+    }
+
+    total = sum(raw_probs.values())
+
+    if total <= 0:
+        return {}
+
+    return {
+        key: probability / total
+        for key, probability in raw_probs.items()
+    }
+
+
+# ============================================================
+# COMPETITIONS
+# ============================================================
+
+@st.cache_data(ttl=86400)
+def get_competitions():
+    """
+    Fetch available competitions.
+    """
+
+    data = api_get("/competitions")
+
+    competitions = data.get(
+        "competitions",
+        [],
+    )
+
+    cleaned = []
+
+    for competition in competitions:
+
+        code = competition.get("code")
+
+        if not code:
+            continue
+
+        cleaned.append(
+            {
+                "id": competition.get("id"),
+                "code": code,
+                "name": competition.get(
+                    "name",
+                    code,
+                ),
+                "area": competition.get(
+                    "area",
+                    {},
+                ).get(
+                    "name",
+                    "",
+                ),
+            }
+        )
+
+    return sorted(
+        cleaned,
+        key=lambda x: x["name"],
+    )
+
+
+# ============================================================
+# FIXTURES
+# ============================================================
+
+@st.cache_data(ttl=1800)
+def get_next_fixture(team_id):
+    """
+    Finds the next scheduled fixture for a team.
+    """
+
+    data = api_get(
+        f"/teams/{team_id}/matches",
+        params={
+            "status": "SCHEDULED",
+            "limit": 20,
+        },
+    )
+
+    matches = data.get(
+        "matches",
+        [],
+    )
+
+    if not matches:
+        return None
+
+    matches.sort(
+        key=lambda m: m.get(
+            "utcDate",
+            "",
+        )
+    )
+
+    match = matches[0]
+
+    return normalise_fixture(match)
+
+
+@st.cache_data(ttl=1800)
+def get_competition_fixtures(
+    competition_code,
+    limit=80,
+):
+    """
+    Returns upcoming fixtures for a competition.
+    """
+
+    data = api_get(
+        f"/competitions/{competition_code}/matches",
+        params={
+            "status": "SCHEDULED",
+            "limit": limit,
+        },
+    )
+
+    matches = data.get(
+        "matches",
+        [],
+    )
+
+    fixtures = []
+
+    for match in matches:
+
+        home = match.get(
+            "homeTeam",
+            {},
+        )
+
+        away = match.get(
+            "awayTeam",
+            {},
+        )
+
+        if not home.get("id"):
+            continue
+
+        if not away.get("id"):
+            continue
+
+        fixtures.append(
+            normalise_fixture(match)
+        )
+
+    fixtures.sort(
+        key=lambda x: x.get(
+            "kickoff",
+            "",
+        )
+    )
+
+    return fixtures
+
+
+def normalise_fixture(match):
+    """
+    Converts every fixture into one consistent structure.
+
+    This is the core architectural improvement:
+    everything always explicitly has a home team
+    and away team.
+    """
+
+    competition = match.get(
+        "competition",
+        {},
+    )
+
+    home = match.get(
+        "homeTeam",
+        {},
+    )
+
+    away = match.get(
+        "awayTeam",
+        {},
+    )
+
+    return {
+        "match_id": match.get("id"),
+
+        "competition": competition.get(
+            "name",
+            "Unknown Competition",
+        ),
+
+        "competition_code": competition.get(
+            "code",
+            "",
+        ),
+
+        "kickoff": match.get(
+            "utcDate",
+        ),
+
+        "home_team_id": home.get("id"),
+
+        "home_team_name": home.get(
+            "name",
+            "Home Team",
+        ),
+
+        "away_team_id": away.get("id"),
+
+        "away_team_name": away.get(
+            "name",
+            "Away Team",
+        ),
+    }
+
+
+# ============================================================
+# TEAMS
+# ============================================================
+
+@st.cache_data(ttl=86400)
+def get_competition_teams(
+    competition_code,
+):
+    """
+    Fetch teams in a competition.
+    """
+
+    data = api_get(
+        f"/competitions/{competition_code}/teams"
+    )
+
+    teams = data.get(
+        "teams",
+        [],
+    )
+
+    cleaned = []
+
+    for team in teams:
+
+        if not team.get("id"):
+            continue
+
+        cleaned.append(
+            {
+                "id": team["id"],
+                "name": team.get(
+                    "name",
+                    "Unknown Team",
+                ),
+            }
+        )
+
+    return sorted(
+        cleaned,
+        key=lambda x: x["name"],
+    )
+
+
+# ============================================================
+# TEAM MATCH DATA
+# ============================================================
+
+@st.cache_data(ttl=1800)
+def get_finished_matches(
+    team_id,
+    limit=30,
+):
+    """
+    Fetch finished matches for a team.
+    """
+
+    data = api_get(
+        f"/teams/{team_id}/matches",
+        params={
+            "status": "FINISHED",
+            "limit": limit,
+        },
+    )
+
+    matches = data.get(
+        "matches",
+        [],
+    )
+
+    matches.sort(
+        key=lambda m: m.get(
+            "utcDate",
+            ""
+        ),
+        reverse=True,
+    )
+
+    return matches
+
+
+def extract_team_match_result(
+    match,
+    team_id,
+):
+    """
+    Returns a team's scored/conceded goals
+    and venue for one match.
+    """
+
+    home = match.get(
+        "homeTeam",
+        {},
+    )
+
+    away = match.get(
+        "awayTeam",
+        {},
+    )
+
+    score = match.get(
+        "score",
+        {},
+    ).get(
+        "fullTime",
+        {},
+    )
+
+    home_goals = score.get("home")
+    away_goals = score.get("away")
+
+    if (
+        home_goals is None
+        or away_goals is None
+    ):
+        return None
+
+    if home.get("id") == team_id:
+
+        return {
+            "venue": "H",
+            "scored": home_goals,
+            "conceded": away_goals,
+        }
+
+    if away.get("id") == team_id:
+
+        return {
+            "venue": "A",
+            "scored": away_goals,
+            "conceded": home_goals,
+        }
+
+    return None
+
+
+def calculate_form(
+    matches,
+    team_id,
+    venue=None,
+    max_matches=None,
+):
+    """
+    Calculates scored/conceded averages.
+
+    Optional:
+        venue="H"
+        venue="A"
+    """
+
+    scored = []
+    conceded = []
+
+    for match in matches:
+
+        result = extract_team_match_result(
+            match,
+            team_id,
+        )
+
+        if not result:
+            continue
+
+        if (
+            venue
+            and result["venue"] != venue
+        ):
+            continue
+
+        scored.append(
+            result["scored"]
+        )
+
+        conceded.append(
+            result["conceded"]
+        )
+
+        if (
+            max_matches
+            and len(scored) >= max_matches
+        ):
+            break
+
+    if not scored:
+
+        return {
+            "matches": 0,
+            "scored": None,
+            "conceded": None,
+        }
+
+    return {
+        "matches": len(scored),
+
+        "scored": (
+            sum(scored)
+            / len(scored)
+        ),
+
+        "conceded": (
+            sum(conceded)
+            / len(conceded)
+        ),
+    }
+
+
+def blended_form(
+    recent,
+    long_term,
+    recent_weight=0.65,
+):
+    """
+    Blends recent form with longer-term form.
+    """
+
+    if (
+        recent["matches"] == 0
+        and long_term["matches"] == 0
+    ):
+        return {
+            "scored": None,
+            "conceded": None,
+        }
+
+    if recent["matches"] == 0:
+        return {
+            "scored": long_term["scored"],
+            "conceded": long_term["conceded"],
+        }
+
+    if long_term["matches"] == 0:
+        return {
+            "scored": recent["scored"],
+            "conceded": recent["conceded"],
+        }
+
+    return {
+        "scored": (
+            recent_weight
+            * recent["scored"]
+            + (1 - recent_weight)
+            * long_term["scored"]
+        ),
+
+        "conceded": (
+            recent_weight
+            * recent["conceded"]
+            + (1 - recent_weight)
+            * long_term["conceded"]
+        ),
+    }
+
+
+def build_team_profile(
+    team_id,
+    venue,
+):
+    """
+    Builds a team profile for the venue
+    they will play in.
+    """
+
+    matches = get_finished_matches(
+        team_id,
+        limit=LONG_TERM_MATCHES_N + 10,
+    )
+
+    overall_recent = calculate_form(
+        matches,
+        team_id,
+        max_matches=RECENT_MATCHES_N,
+    )
+
+    overall_long = calculate_form(
+        matches,
+        team_id,
+        max_matches=LONG_TERM_MATCHES_N,
+    )
+
+    venue_recent = calculate_form(
+        matches,
+        team_id,
+        venue=venue,
+        max_matches=RECENT_MATCHES_N,
+    )
+
+    venue_long = calculate_form(
+        matches,
+        team_id,
+        venue=venue,
+        max_matches=LONG_TERM_MATCHES_N,
+    )
+
+    overall = blended_form(
+        overall_recent,
+        overall_long,
+    )
+
+    venue_form = blended_form(
+        venue_recent,
+        venue_long,
+    )
+
+    # Blend venue-specific and overall data.
+    # Venue gets more importance when enough matches exist.
+
+    if (
+        venue_form["scored"] is None
+        or venue_form["conceded"] is None
+    ):
+
+        combined = overall
+
+    else:
+
+        venue_sample = min(
+            venue_long["matches"],
+            10,
+        )
+
+        venue_weight = min(
+            0.70,
+            0.30 + venue_sample * 0.04,
+        )
+
+        overall_weight = (
+            1 - venue_weight
+        )
+
+        combined = {
+            "scored": (
+                venue_weight
+                * venue_form["scored"]
+                + overall_weight
+                * overall["scored"]
+            ),
+
+            "conceded": (
+                venue_weight
+                * venue_form["conceded"]
+                + overall_weight
+                * overall["conceded"]
+            ),
+        }
+
+    return {
+        "team_id": team_id,
+
+        "venue": venue,
+
+        "recent": overall_recent,
+
+        "long_term": overall_long,
+
+        "venue_recent": venue_recent,
+
+        "venue_long": venue_long,
+
+        "blended_scored": combined[
+            "scored"
+        ],
+
+        "blended_conceded": combined[
+            "conceded"
+        ],
+    }
+
+
+# ============================================================
+# LEAGUE BASELINES
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def get_league_baselines(
+    competition_code,
+):
+    """
+    Calculates actual home and away scoring
+    averages from finished competition matches.
+
+    This is preferable to simply assuming:
+        home = league_average * 1.08
+        away = league_average * 0.92
+    """
+
+    data = api_get(
+        f"/competitions/{competition_code}/matches",
+        params={
+            "status": "FINISHED",
+        },
+    )
+
+    matches = data.get(
+        "matches",
+        [],
+    )
+
+    home_goals = []
+    away_goals = []
+
+    for match in matches:
+
+        score = match.get(
+            "score",
+            {},
+        ).get(
+            "fullTime",
+            {},
+        )
+
+        home = score.get("home")
+        away = score.get("away")
+
+        if (
+            home is None
+            or away is None
+        ):
+            continue
+
+        home_goals.append(home)
+        away_goals.append(away)
+
+    if not home_goals:
+
+        return {
+            "home_goals": 1.50,
+            "away_goals": (
+                1.50
+                / HOME_ADVANTAGE_FALLBACK
+            ),
+            "matches": 0,
+        }
+
+    return {
+        "home_goals": (
+            sum(home_goals)
+            / len(home_goals)
+        ),
+
+        "away_goals": (
+            sum(away_goals)
+            / len(away_goals)
+        ),
+
+        "matches": len(home_goals),
+    }
+
+
+# ============================================================
+# EXPECTED GOALS MODEL
+# ============================================================
+
+def shrink_to_baseline(
+    value,
+    sample_size,
+    baseline,
+    regression_matches=REGRESSION_MATCHES,
+):
+    """
+    Bayesian-style regression toward league average.
+
+    Example:
+    A team averaging 3.5 goals over only two matches
+    should not be treated as a true 3.5-goal attack.
+    """
+
+    if value is None:
+        return baseline
+
+    sample_size = max(
+        sample_size,
+        0,
+    )
+
+    weight = (
+        sample_size
+        / (
+            sample_size
+            + regression_matches
+        )
+    )
+
+    return (
+        weight * value
+        + (1 - weight) * baseline
+    )
+
+
+def calculate_match_expected_goals(
+    home_profile,
+    away_profile,
+    league,
+):
+    """
+    Calculates expected goals from explicit:
+
+        HOME ATTACK
+        HOME DEFENCE
+
+        AWAY ATTACK
+        AWAY DEFENCE
+
+    Every estimate is league-relative.
+    """
+
+    league_home = league[
+        "home_goals"
+    ]
+
+    league_away = league[
+        "away_goals"
+    ]
+
+    home_sample = max(
+        home_profile[
+            "venue_long"
+        ]["matches"],
+        home_profile[
+            "long_term"
+        ]["matches"],
+    )
+
+    away_sample = max(
+        away_profile[
+            "venue_long"
+        ]["matches"],
+        away_profile[
+            "long_term"
+        ]["matches"],
+    )
+
+    # HOME TEAM ATTACK
+
+    home_attack_goals = shrink_to_baseline(
+        home_profile[
+            "blended_scored"
+        ],
+        home_sample,
+        league_home,
+    )
+
+    # HOME TEAM DEFENSIVE BASELINE:
+    # away teams score at league_away on average
+
+    home_defence_conceded = shrink_to_baseline(
+        home_profile[
+            "blended_conceded"
+        ],
+        home_sample,
+        league_away,
+    )
+
+    # AWAY TEAM ATTACK
+
+    away_attack_goals = shrink_to_baseline(
+        away_profile[
+            "blended_scored"
+        ],
+        away_sample,
+        league_away,
+    )
+
+    # AWAY TEAM DEFENCE:
+    # home teams score at league_home on average
+
+    away_defence_conceded = shrink_to_baseline(
+        away_profile[
+            "blended_conceded"
+        ],
+        away_sample,
+        league_home,
+    )
+
+    # Attack strengths
+
+    home_attack_strength = (
+        home_attack_goals
+        / league_home
+        if league_home > 0
+        else 1
+    )
+
+    away_attack_strength = (
+        away_attack_goals
+        / league_away
+        if league_away > 0
+        else 1
+    )
+
+    # Defensive weakness strengths:
+    # > 1 means conceding more than baseline
+
+    home_defence_weakness = (
+        home_defence_conceded
+        / league_away
+        if league_away > 0
+        else 1
+    )
+
+    away_defence_weakness = (
+        away_defence_conceded
+        / league_home
+        if league_home > 0
+        else 1
+    )
+
+    # Multiplicative attack × opponent defensive weakness model.
+
+    home_xg = (
+        league_home
+        * home_attack_strength
+        * away_defence_weakness
+    )
+
+    away_xg = (
+        league_away
+        * away_attack_strength
+        * home_defence_weakness
+    )
+
+    # Reasonable safety limits.
+
+    home_xg = max(
+        0.10,
+        min(home_xg, 5.50),
+    )
+
+    away_xg = max(
+        0.10,
+        min(away_xg, 5.50),
+    )
+
+    diagnostics = {
+        "league_home": league_home,
+        "league_away": league_away,
+
+        "home_attack_goals": (
+            home_attack_goals
+        ),
+
+        "away_attack_goals": (
+            away_attack_goals
+        ),
+
+        "home_defence_conceded": (
+            home_defence_conceded
+        ),
+
+        "away_defence_conceded": (
+            away_defence_conceded
+        ),
+
+        "home_attack_strength": (
+            home_attack_strength
+        ),
+
+        "away_attack_strength": (
+            away_attack_strength
+        ),
+
+        "home_defence_weakness": (
+            home_defence_weakness
+        ),
+
+        "away_defence_weakness": (
+            away_defence_weakness
+        ),
+    }
+
+    return (
+        round(home_xg, 2),
+        round(away_xg, 2),
+        diagnostics,
+    )
+
+
+# ============================================================
+# POISSON MODEL
+# ============================================================
+
+def compute_model(
+    home_xg,
+    away_xg,
+    max_goals=MAX_GOALS,
+):
+    """
+    Creates score probabilities and
+    derives market probabilities.
+    """
+
+    matrix = {}
+
+    total_probability = 0.0
+
+    for home_goals in range(
+        max_goals + 1
+    ):
+
+        for away_goals in range(
+            max_goals + 1
+        ):
+
+            probability = (
+                poisson_pmf(
+                    home_xg,
+                    home_goals,
+                )
+                * poisson_pmf(
+                    away_xg,
+                    away_goals,
+                )
+            )
+
+            matrix[
+                (
+                    home_goals,
+                    away_goals,
+                )
+            ] = probability
+
+            total_probability += probability
+
+    # Normalise truncated matrix.
+
+    if total_probability > 0:
+
+        matrix = {
+            score: probability
+            / total_probability
+
+            for score, probability
+            in matrix.items()
+        }
+
+    model = {
+        "home": 0.0,
+        "draw": 0.0,
+        "away": 0.0,
+        "over25": 0.0,
+        "under25": 0.0,
+        "bttsY": 0.0,
+        "bttsN": 0.0,
+    }
+
+    for (
+        home_goals,
+        away_goals,
+    ), probability in matrix.items():
+
+        if home_goals > away_goals:
+            model["home"] += probability
+
+        elif home_goals == away_goals:
+            model["draw"] += probability
+
+        else:
+            model["away"] += probability
+
+        if (
+            home_goals
+            + away_goals
+            >= 3
+        ):
+            model["over25"] += probability
+
+        else:
+            model["under25"] += probability
+
+        if (
+            home_goals >= 1
+            and away_goals >= 1
+        ):
+            model["bttsY"] += probability
+
+        else:
+            model["bttsN"] += probability
+
+    return (
+        model,
+        matrix,
+    )
+
+
+def cards_over_under(
+    lam,
+    threshold=CARDS_THRESHOLD,
+):
+    """
+    Poisson approximation for total cards.
+
+    For 3.5:
+        Under = 0,1,2,3
+        Over  = 4+
+    """
+
+    floor_threshold = int(
+        math.floor(threshold)
+    )
+
+    under = sum(
+        poisson_pmf(lam, k)
+        for k in range(
+            floor_threshold + 1
+        )
+    )
+
+    over = 1 - under
+
+    return over, under
+
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+def build_summary_row(
+    fixture,
+    home_xg,
+    away_xg,
+    market_label,
+    model_probability,
+    odds,
+    market_probability,
+    edge,
+    verdict_name,
+):
+    return [
+        datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y-%m-%d"
+        ),
+
+        fixture["competition"],
+
+        fixture["home_team_name"],
+
+        fixture["away_team_name"],
+
+        fixture["kickoff"],
+
+        f"{home_xg:.2f}",
+
+        f"{away_xg:.2f}",
+
+        market_label,
+
+        f"{model_probability:.4f}",
+
+        f"{odds:.2f}",
+
+        f"{market_probability:.4f}",
+
+        f"{edge:.4f}",
+
+        verdict_name,
+    ]
 
 
 # ============================================================
@@ -162,42 +1412,219 @@ SUMMARY_HEADER = [
 st.markdown(
     """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500;700&display=swap');
-    .stApp { background-color: #0C0F0A; }
-    html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-    .hero {
-        background: linear-gradient(135deg, #1A0508 0%, #0C0F0A 70%);
-        border: 1px solid #2A332A; border-left: 4px solid #C8102E;
-        border-radius: 10px; padding: 22px 24px; margin-bottom: 18px;
-    }
-    .hero-title { font-family: 'Bebas Neue', sans-serif; font-size: 40px; letter-spacing: 1px; color: #EDEDE6; line-height: 1; }
-    .hero-title span { color: #C8102E; }
-    .hero-sub { color: #8B948A; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; margin-top: 6px; }
-    .hero-fixture { font-family: 'Bebas Neue', sans-serif; font-size: 26px; color: #E8B33D; margin-top: 14px; letter-spacing: 0.4px; }
-    .hero-meta { color: #8B948A; font-size: 13px; margin-top: 2px; }
-    .section-label { color: #8B948A; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 5px; }
-    .model-card { background: #171B14; border: 1px solid #2A332A; border-radius: 8px; padding: 14px 16px; margin-bottom: 8px; }
-    .model-card-title { color: #EDEDE6; font-weight: 600; font-size: 14px; }
-    .model-card-value { color: #E8B33D; font-family: 'IBM Plex Mono', monospace; font-size: 22px; font-weight: 700; margin-top: 3px; }
-    .model-card-sub { color: #8B948A; font-size: 11px; margin-top: 3px; }
-    .market-card { background: #171B14; border: 1px solid #2A332A; border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; }
-    .market-name { font-weight: 600; font-size: 14px; color: #EDEDE6; }
-    .model-pct { color: #8B948A; font-size: 12px; font-family: 'IBM Plex Mono', monospace; }
-    .badge { display: inline-block; padding: 4px 11px; border-radius: 12px; font-size: 12px; font-weight: 700; letter-spacing: 0.03em; font-family: 'IBM Plex Mono', monospace; }
-    .badge-value { background: rgba(76,175,125,0.18); color: #4CAF7D; }
-    .badge-avoid { background: rgba(193,99,63,0.18); color: #C1633F; }
-    .badge-marginal { background: rgba(139,148,138,0.18); color: #8B948A; }
-    .best-value {
-        background: linear-gradient(135deg, #172319 0%, #111710 100%);
-        border: 1px solid #31543D; border-left: 4px solid #4CAF7D; border-radius: 9px;
-        padding: 16px 18px; margin: 10px 0 18px 0;
-    }
-    .best-value-title { color: #8B948A; font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700; }
-    .best-value-market { color: #EDEDE6; font-size: 21px; font-weight: 700; margin-top: 4px; }
-    .best-value-edge { color: #4CAF7D; font-family: 'IBM Plex Mono', monospace; font-size: 16px; margin-top: 4px; }
-    .warning-box { background: #201C12; border: 1px solid #4A4025; border-radius: 8px; padding: 12px 15px; color: #C9B77A; font-size: 12px; }
-    .stTabs [data-baseweb="tab"] { font-weight: 600; }
-    div[data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', monospace; color: #E8B33D; }
+
+@import url(
+'https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap'
+);
+
+.stApp {
+    background-color: #0C0F0A;
+}
+
+html,
+body,
+[class*="css"] {
+    font-family: 'Inter', sans-serif;
+}
+
+.hero {
+    background:
+        linear-gradient(
+            135deg,
+            #1A0508 0%,
+            #0C0F0A 70%
+        );
+
+    border: 1px solid #2A332A;
+    border-left: 4px solid #C8102E;
+
+    border-radius: 12px;
+
+    padding: 24px;
+
+    margin-bottom: 18px;
+}
+
+.hero-title {
+    font-family:
+        'Bebas Neue',
+        sans-serif;
+
+    font-size: 42px;
+
+    letter-spacing: 1px;
+
+    color: #EDEDE6;
+
+    line-height: 1;
+}
+
+.hero-title span {
+    color: #C8102E;
+}
+
+.hero-sub {
+    color: #8B948A;
+
+    font-size: 12px;
+
+    text-transform: uppercase;
+
+    letter-spacing: 0.08em;
+
+    margin-top: 7px;
+}
+
+.hero-fixture {
+    font-family:
+        'Bebas Neue',
+        sans-serif;
+
+    font-size: 30px;
+
+    color: #E8B33D;
+
+    margin-top: 16px;
+
+    letter-spacing: 0.4px;
+}
+
+.hero-meta {
+    color: #8B948A;
+
+    font-size: 13px;
+
+    margin-top: 4px;
+}
+
+.badge {
+    display: inline-block;
+
+    padding: 5px 11px;
+
+    border-radius: 12px;
+
+    font-size: 12px;
+
+    font-weight: 700;
+
+    letter-spacing: 0.03em;
+
+    font-family:
+        'IBM Plex Mono',
+        monospace;
+}
+
+.badge-value {
+    background:
+        rgba(
+            76,
+            175,
+            125,
+            0.18
+        );
+
+    color: #4CAF7D;
+}
+
+.badge-avoid {
+    background:
+        rgba(
+            193,
+            99,
+            63,
+            0.18
+        );
+
+    color: #C1633F;
+}
+
+.badge-marginal {
+    background:
+        rgba(
+            139,
+            148,
+            138,
+            0.18
+        );
+
+    color: #8B948A;
+}
+
+.market-card {
+    background: #171B14;
+
+    border:
+        1px solid #2A332A;
+
+    border-radius: 9px;
+
+    padding: 13px 16px;
+
+    margin-bottom: 8px;
+}
+
+.market-name {
+    font-weight: 600;
+
+    font-size: 14px;
+
+    color: #EDEDE6;
+}
+
+.model-pct {
+    color: #8B948A;
+
+    font-size: 12px;
+
+    font-family:
+        'IBM Plex Mono',
+        monospace;
+}
+
+.inspector-card {
+    background: #171B14;
+
+    border:
+        1px solid #2A332A;
+
+    border-radius: 9px;
+
+    padding: 14px;
+
+    margin-bottom: 10px;
+}
+
+.inspector-title {
+    color: #E8B33D;
+
+    font-weight: 700;
+
+    font-size: 13px;
+
+    margin-bottom: 8px;
+}
+
+.inspector-row {
+    color: #B8C0B5;
+
+    font-family:
+        'IBM Plex Mono',
+        monospace;
+
+    font-size: 12px;
+
+    margin: 3px 0;
+}
+
+div[data-testid="stMetricValue"] {
+    font-family:
+        'IBM Plex Mono',
+        monospace;
+
+    color: #E8B33D;
+}
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -205,708 +1632,1183 @@ st.markdown(
 
 
 # ============================================================
-# API  (fix #1: never halts the app — returns None on any failure)
-# ============================================================
-
-def api_get(path, params=None):
-    """
-    Makes a Football-Data.org API request. Returns the parsed JSON on
-    success, or None on any failure (timeout, rate limit, HTTP error,
-    network error). Callers decide what None means for them — critical
-    data (the fixture itself) should stop the page; everything else
-    should fall back gracefully.
-    """
-    if not API_KEY:
-        return None
-
-    headers = {"X-Auth-Token": API_KEY}
-
-    try:
-        response = requests.get(
-            f"{BASE_URL}{path}", headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT,
-        )
-        if response.status_code == 429:
-            st.toast("Football data API rate limit reached — some data may be using fallback estimates.", icon="⚠️")
-            return None
-        response.raise_for_status()
-        return response.json()
-
-    except requests.Timeout:
-        st.toast("Football data service timed out — using fallback estimates where needed.", icon="⚠️")
-        return None
-    except requests.HTTPError:
-        st.toast(f"Football data service returned an error ({response.status_code}).", icon="⚠️")
-        return None
-    except requests.RequestException:
-        st.toast("Couldn't reach the football data service — using fallback estimates where needed.", icon="⚠️")
-        return None
-
-
-# ============================================================
-# FIXTURE  (the one place that's still allowed to stop the page —
-# there's genuinely nothing useful to show without a fixture)
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def get_next_fixture(team_id):
-    data = api_get(f"/teams/{team_id}/matches", params={"status": "SCHEDULED", "limit": 15})
-    if data is None:
-        return None
-
-    matches = data.get("matches", [])
-    if not matches:
-        return None
-
-    matches.sort(key=lambda match: match["utcDate"])
-    match = matches[0]
-    is_home = match["homeTeam"]["id"] == team_id
-    opponent = match["awayTeam"]["name"] if is_home else match["homeTeam"]["name"]
-    opponent_id = match["awayTeam"]["id"] if is_home else match["homeTeam"]["id"]
-    competition = match.get("competition", {})
-
-    return {
-        "opponent": opponent,
-        "opponent_id": opponent_id,
-        "venue": "H" if is_home else "A",
-        "kickoff": match["utcDate"],
-        "competition": competition.get("name", "Unknown"),
-        "competition_code": competition.get("code"),
-        "competition_id": competition.get("id"),
-    }
-
-
-# ============================================================
-# TEAM MATCH DATA  (fix #1 continued: empty list on failure,
-# summarise_matches already has fallback averages for this case)
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def get_finished_matches(team_id, limit=LONG_TERM_MATCHES_N):
-    data = api_get(f"/teams/{team_id}/matches", params={"status": "FINISHED", "limit": limit})
-    if data is None:
-        return []
-    matches = data.get("matches", [])
-    matches.sort(key=lambda match: match["utcDate"], reverse=True)
-    return matches
-
-
-def extract_team_result(match, team_id):
-    home_id = match["homeTeam"]["id"]
-    away_id = match["awayTeam"]["id"]
-
-    if team_id == home_id:
-        venue = "home"
-        scored = match["score"]["fullTime"]["home"]
-        conceded = match["score"]["fullTime"]["away"]
-    elif team_id == away_id:
-        venue = "away"
-        scored = match["score"]["fullTime"]["away"]
-        conceded = match["score"]["fullTime"]["home"]
-    else:
-        return None
-
-    if scored is None or conceded is None:
-        return None
-
-    return {"scored": scored, "conceded": conceded, "venue": venue, "date": match["utcDate"]}
-
-
-def summarise_matches(matches, team_id):
-    rows = [r for r in (extract_team_result(m, team_id) for m in matches) if r]
-
-    if not rows:
-        return {
-            "matches": 0, "scored": 1.3, "conceded": 1.3,
-            "home_matches": 0, "away_matches": 0,
-            "home_scored": None, "home_conceded": None,
-            "away_scored": None, "away_conceded": None,
-        }
-
-    scored = [row["scored"] for row in rows]
-    conceded = [row["conceded"] for row in rows]
-    home_rows = [row for row in rows if row["venue"] == "home"]
-    away_rows = [row for row in rows if row["venue"] == "away"]
-
-    def average(values):
-        return sum(values) / len(values) if values else None
-
-    return {
-        "matches": len(rows),
-        "scored": average(scored),
-        "conceded": average(conceded),
-        "home_matches": len(home_rows),
-        "away_matches": len(away_rows),
-        "home_scored": average([r["scored"] for r in home_rows]),
-        "home_conceded": average([r["conceded"] for r in home_rows]),
-        "away_scored": average([r["scored"] for r in away_rows]),
-        "away_conceded": average([r["conceded"] for r in away_rows]),
-    }
-
-
-@st.cache_data(ttl=3600)
-def get_team_form(team_id):
-    matches = get_finished_matches(team_id, limit=LONG_TERM_MATCHES_N)
-    recent_matches = matches[:RECENT_MATCHES_N]
-    return {
-        "recent": summarise_matches(recent_matches, team_id),
-        "long_term": summarise_matches(matches, team_id),
-    }
-
-
-# ============================================================
-# LEAGUE DATA  (fix #1 continued: this is the exact function whose
-# fallback never used to run — now it actually gets the chance to)
-# ============================================================
-
-@st.cache_data(ttl=3600)
-def get_competition_standings(competition_code):
-    if not competition_code:
-        return []
-    data = api_get(f"/competitions/{competition_code}/standings")
-    if data is None:
-        return []
-    standings = data.get("standings", [])
-    if not standings:
-        return []
-    return standings[0].get("table", [])
-
-
-def calculate_league_averages(standings):
-    fallback = {"goals_per_team_per_match": 1.35, "home_goals": 1.50, "away_goals": 1.15}
-    if not standings:
-        return fallback
-
-    total_goals_for = 0
-    total_matches = 0
-    for row in standings:
-        played = row.get("playedGames", 0)
-        goals_for = row.get("goalsFor", 0)
-        if played > 0:
-            total_goals_for += goals_for
-            total_matches += played
-
-    if total_matches <= 0:
-        return fallback
-
-    goals_per_team_per_match = total_goals_for / total_matches
-    return {
-        "goals_per_team_per_match": goals_per_team_per_match,
-        "home_goals": goals_per_team_per_match * 1.08,
-        "away_goals": goals_per_team_per_match * 0.92,
-    }
-
-
-# ============================================================
-# STRENGTH MODEL
-# ============================================================
-
-def safe_divide(numerator, denominator, fallback=1.0):
-    if denominator is None or denominator <= 0:
-        return fallback
-    return numerator / denominator
-
-
-def weighted_average(recent, long_term):
-    if recent is None:
-        return long_term
-    if long_term is None:
-        return recent
-    return recent * RECENT_WEIGHT + long_term * LONG_TERM_WEIGHT
-
-
-def contextual_average(overall, venue_specific):
-    if venue_specific is None:
-        return overall
-    return overall * (1 - VENUE_WEIGHT) + venue_specific * VENUE_WEIGHT
-
-
-def build_team_profile(form, league_average):
-    recent = form["recent"]
-    long_term = form["long_term"]
-
-    overall_scored = weighted_average(recent["scored"], long_term["scored"])
-    overall_conceded = weighted_average(recent["conceded"], long_term["conceded"])
-
-    home_scored = contextual_average(overall_scored, long_term["home_scored"])
-    home_conceded = contextual_average(overall_conceded, long_term["home_conceded"])
-    away_scored = contextual_average(overall_scored, long_term["away_scored"])
-    away_conceded = contextual_average(overall_conceded, long_term["away_conceded"])
-
-    league_mean = league_average["goals_per_team_per_match"]
-
-    def shrink(value):
-        return value * TEAM_STRENGTH_WEIGHT + 1.0 * LEAGUE_MEAN_WEIGHT
-
-    return {
-        "overall_scored": overall_scored, "overall_conceded": overall_conceded,
-        "home_scored": home_scored, "home_conceded": home_conceded,
-        "away_scored": away_scored, "away_conceded": away_conceded,
-        "attack_overall": shrink(safe_divide(overall_scored, league_mean)),
-        "defence_overall": shrink(safe_divide(overall_conceded, league_mean)),
-        "home_attack": shrink(safe_divide(home_scored, league_mean)),
-        "home_defence": shrink(safe_divide(home_conceded, league_mean)),
-        "away_attack": shrink(safe_divide(away_scored, league_mean)),
-        "away_defence": shrink(safe_divide(away_conceded, league_mean)),
-    }
-
-
-def calculate_expected_goals(team_profile, opponent_profile, team_venue, league_average):
-    league_home = league_average["home_goals"]
-    league_away = league_average["away_goals"]
-
-    if team_venue == "home":
-        team_expected = league_home * team_profile["home_attack"] * opponent_profile["away_defence"]
-        opponent_expected = league_away * opponent_profile["away_attack"] * team_profile["home_defence"]
-    else:
-        team_expected = league_away * team_profile["away_attack"] * opponent_profile["home_defence"]
-        opponent_expected = league_home * opponent_profile["home_attack"] * team_profile["away_defence"]
-
-    team_expected = max(0.05, min(team_expected, 6.0))
-    opponent_expected = max(0.05, min(opponent_expected, 6.0))
-    return round(team_expected, 2), round(opponent_expected, 2)
-
-
-# ============================================================
-# POISSON MODEL
-# ============================================================
-
-def poisson_pmf(lam, k):
-    if lam <= 0:
-        return 1.0 if k == 0 else 0.0
-    return math.exp(-lam) * (lam ** k) / math.factorial(k)
-
-
-def compute_model(xg_home, xg_away, max_goals=MAX_GOALS):
-    raw_matrix = []
-    total_probability = 0.0
-
-    for home_goals in range(max_goals + 1):
-        row = []
-        for away_goals in range(max_goals + 1):
-            probability = poisson_pmf(xg_home, home_goals) * poisson_pmf(xg_away, away_goals)
-            row.append(probability)
-            total_probability += probability
-        raw_matrix.append(row)
-
-    if total_probability <= 0:
-        raise ValueError("Could not construct probability model.")
-
-    probabilities = {"home": 0.0, "draw": 0.0, "away": 0.0, "over25": 0.0, "under25": 0.0, "bttsY": 0.0, "bttsN": 0.0}
-
-    for home_goals, row in enumerate(raw_matrix):
-        for away_goals, raw_probability in enumerate(row):
-            p = raw_probability / total_probability
-            if home_goals > away_goals:
-                probabilities["home"] += p
-            elif home_goals == away_goals:
-                probabilities["draw"] += p
-            else:
-                probabilities["away"] += p
-            if home_goals + away_goals >= 3:
-                probabilities["over25"] += p
-            else:
-                probabilities["under25"] += p
-            if home_goals >= 1 and away_goals >= 1:
-                probabilities["bttsY"] += p
-            else:
-                probabilities["bttsN"] += p
-
-    return probabilities
-
-
-# ============================================================
-# CARDS
-# ============================================================
-
-def cards_over_under(lam, threshold=CARDS_THRESHOLD):
-    floor_threshold = int(math.floor(threshold))
-    under = sum(poisson_pmf(lam, k) for k in range(floor_threshold + 1))
-    return 1 - under, under
-
-
-# ============================================================
-# ODDS
-# ============================================================
-
-def parse_odds(value):
-    if value is None:
-        return None
-    value = value.strip()
-    if not value:
-        return None
-    try:
-        if "/" in value:
-            parts = value.split("/")
-            if len(parts) != 2:
-                return None
-            numerator = float(parts[0].strip())
-            denominator = float(parts[1].strip())
-            if numerator < 0 or denominator <= 0:
-                return None
-            decimal_odds = (numerator / denominator) + 1
-        else:
-            decimal_odds = float(value)
-
-        if not math.isfinite(decimal_odds) or decimal_odds <= 1:
-            return None
-        return decimal_odds
-    except (ValueError, ZeroDivisionError):
-        return None
-
-
-def implied_probability(odds):
-    if odds is None or odds <= 1:
-        return None
-    return 1 / odds
-
-
-def calculate_fair_probabilities(odds_by_key, market_keys):
-    available = [key for key in market_keys if key in odds_by_key]
-    if len(available) != len(market_keys):
-        return {}
-
-    probabilities = {key: implied_probability(odds_by_key[key]) for key in market_keys}
-    overround = sum(probabilities.values())
-    if overround <= 0:
-        return {}
-
-    return {key: probabilities[key] / overround for key in market_keys}
-
-
-def verdict(edge):
-    if edge >= VALUE_EDGE_THRESHOLD:
-        return "VALUE"
-    if edge <= -VALUE_EDGE_THRESHOLD:
-        return "AVOID"
-    return "marginal"
-
-
-# ============================================================
-# SUMMARY ROW  (fix #3: back to the 11-column format the tracker
-# spreadsheet expects — edge still benefits from the fair-market
-# de-vig internally, it's just not added as an extra column)
-# ============================================================
-
-def build_summary_row(fixture, xg_liv, xg_opp, market_label, model_p, odds, edge, verdict_str):
-    implied = implied_probability(odds)
-    return [
-        datetime.now().strftime("%Y-%m-%d"),
-        fixture["opponent"],
-        fixture["venue"],
-        xg_liv,
-        xg_opp,
-        market_label,
-        f"{model_p:.4f}",
-        f"{odds:.2f}",
-        f"{implied:.4f}" if implied is not None else "",
-        f"{edge:.4f}",
-        verdict_str,
-    ]
-
-
-# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
-    st.markdown("### Weekly routine")
+
     st.markdown(
-        "1. Open your bookmarked app URL\n"
-        "2. Check the fixture and model inputs\n"
-        "3. Enter this week's odds\n"
-        "4. Copy the summary into your spreadsheet"
+        "# ⚽ The Boot Room"
     )
-    st.divider()
-    st.markdown("### Model settings")
-    st.caption(f"Recent form: {RECENT_MATCHES_N} matches · Long-term: {LONG_TERM_MATCHES_N} matches")
-    st.caption(f"Recent weighting: {RECENT_WEIGHT:.0%} · Long-term: {LONG_TERM_WEIGHT:.0%}")
-    st.caption(f"VALUE threshold: {VALUE_EDGE_THRESHOLD:.0%}")
 
+    page = st.radio(
+        "Choose analysis",
+        [
+            "🏠 Liverpool Next Match",
+            "🔎 Analyse Any Match",
+        ],
+    )
 
-# ============================================================
-# API KEY CHECK
-# ============================================================
-
-if not API_KEY:
-    st.error("FOOTBALL_DATA_KEY isn't set. Add it under App Settings > Secrets (hosted) or as an environment variable (local).")
-    st.stop()
-
-
-# ============================================================
-# FIXTURE
-# ============================================================
-
-fixture = get_next_fixture(LIVERPOOL_ID)
-if not fixture:
-    st.error("Couldn't find an upcoming fixture, or couldn't reach the football data service. Try refreshing shortly.")
-    st.stop()
-
-kickoff_dt = datetime.fromisoformat(fixture["kickoff"].replace("Z", "+00:00"))
-now_utc = datetime.now(timezone.utc)
-delta = kickoff_dt - now_utc
-
-if delta.total_seconds() > 0:
-    total_hours = int(delta.total_seconds() // 3600)
-    countdown_text = f"{total_hours // 24}d {total_hours % 24}h to kickoff"
-else:
-    countdown_text = "Kickoff passed"
-
-venue_word = "vs" if fixture["venue"] == "H" else "at"
-
-st.markdown(f"""
-<div class="hero">
-    <div class="hero-title">The Boot <span>Room</span></div>
-    <div class="hero-sub">Liverpool value-bet model &middot; league-relative expected goals vs. the odds</div>
-    <div class="hero-fixture">Liverpool {venue_word} {fixture['opponent']}</div>
-    <div class="hero-meta">{fixture['competition']} &middot; {kickoff_dt.strftime('%a %d %b, %H:%M UTC')} &middot; {countdown_text}</div>
-</div>
-""", unsafe_allow_html=True)
-
-
-# ============================================================
-# LEAGUE + FORM + PROFILES
-# ============================================================
-
-standings = get_competition_standings(fixture["competition_code"])
-league_average = calculate_league_averages(standings)
-
-if not standings:
-    st.caption("⚠️ League standings weren't available this run — using typical league-average baselines instead of live ones.")
-
-liv_form = get_team_form(LIVERPOOL_ID)
-opp_form = get_team_form(fixture["opponent_id"])
-liv_profile = build_team_profile(liv_form, league_average)
-opp_profile = build_team_profile(opp_form, league_average)
-
-auto_xg_liv, auto_xg_opp = calculate_expected_goals(liv_profile, opp_profile, fixture["venue"], league_average)
-
-
-# ============================================================
-# MODEL INPUT INSPECTOR
-# ============================================================
-
-with st.expander("⚽ Model inputs & league-relative strengths", expanded=False):
-    st.caption("The model compares each team's scoring and conceding rates against the league baseline. A strength of 1.00 means league average.")
-    st.markdown('<div class="section-label">League baseline</div>', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Goals / team / match", f"{league_average['goals_per_team_per_match']:.2f}")
-    c2.metric("Home baseline", f"{league_average['home_goals']:.2f}")
-    c3.metric("Away baseline", f"{league_average['away_goals']:.2f}")
     st.divider()
 
-    st.markdown('<div class="section-label">Liverpool</div>', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Recent scored", f"{liv_form['recent']['scored']:.2f}")
-    c2.metric("Long-term scored", f"{liv_form['long_term']['scored']:.2f}")
-    c3.metric("Long-term conceded", f"{liv_form['long_term']['conceded']:.2f}")
-    st.write("")
-    c1, c2, c3 = st.columns(3)
-    if fixture["venue"] == "H":
-        c1.metric("Home attack", f"{liv_profile['home_attack']:.2f}")
-        c2.metric("Home defence", f"{liv_profile['home_defence']:.2f}")
-        c3.metric("Home matches", liv_form["long_term"]["home_matches"])
+    st.markdown(
+        "### How to use it"
+    )
+
+    st.markdown(
+        """
+1. Choose a match
+2. Check the model's estimated goals
+3. Adjust if you have information the model cannot know
+4. Enter bookmaker odds
+5. Compare model probability with market probability
+"""
+    )
+
+    st.divider()
+
+    st.caption(
+        "The model estimates probabilities from historical scoring patterns. "
+        "It does not guarantee outcomes."
+    )
+
+
+# ============================================================
+# FIXTURE SELECTION
+# ============================================================
+
+def fixture_label(fixture):
+
+    kickoff = parse_datetime(
+        fixture["kickoff"]
+    )
+
+    if kickoff:
+
+        date_text = kickoff.strftime(
+            "%a %d %b %H:%M UTC"
+        )
+
     else:
-        c1.metric("Away attack", f"{liv_profile['away_attack']:.2f}")
-        c2.metric("Away defence", f"{liv_profile['away_defence']:.2f}")
-        c3.metric("Away matches", liv_form["long_term"]["away_matches"])
-    st.divider()
+        date_text = "Date TBC"
 
-    st.markdown(f'<div class="section-label">{fixture["opponent"]}</div>', unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Recent scored", f"{opp_form['recent']['scored']:.2f}")
-    c2.metric("Long-term scored", f"{opp_form['long_term']['scored']:.2f}")
-    c3.metric("Long-term conceded", f"{opp_form['long_term']['conceded']:.2f}")
-    st.write("")
-    c1, c2, c3 = st.columns(3)
-    if fixture["venue"] == "H":
-        c1.metric("Away attack", f"{opp_profile['away_attack']:.2f}")
-        c2.metric("Away defence", f"{opp_profile['away_defence']:.2f}")
-        c3.metric("Away matches", opp_form["long_term"]["away_matches"])
-    else:
-        c1.metric("Home attack", f"{opp_profile['home_attack']:.2f}")
-        c2.metric("Home defence", f"{opp_profile['home_defence']:.2f}")
-        c3.metric("Home matches", opp_form["long_term"]["home_matches"])
-    st.divider()
-    st.caption("Strength interpretation: attack > 1.00 means the team scores more than the league baseline. Defence > 1.00 means the team concedes more than the league baseline, so lower defensive strength is better.")
+    return (
+        f"{fixture['home_team_name']} vs "
+        f"{fixture['away_team_name']} "
+        f"— {date_text}"
+    )
 
 
-# ============================================================
-# MANUAL EXPECTED GOALS ADJUSTMENT
-# ============================================================
+def choose_fixture():
 
-with st.expander("🎛 Expected goals — inspect or manually adjust", expanded=False):
+    # --------------------------------------------------------
+    # LIVERPOOL MODE
+    # --------------------------------------------------------
+
+    if page == "🏠 Liverpool Next Match":
+
+        fixture = get_next_fixture(
+            LIVERPOOL_ID
+        )
+
+        if not fixture:
+            st.error(
+                "Could not find Liverpool's next scheduled fixture."
+            )
+            return None
+
+        return fixture
+
+    # --------------------------------------------------------
+    # ANY MATCH MODE
+    # --------------------------------------------------------
+
+    st.title(
+        "Analyse Any Match"
+    )
+
+    selection_mode = st.radio(
+        "How do you want to choose the match?",
+        [
+            "Upcoming fixture",
+            "Choose teams manually",
+        ],
+        horizontal=True,
+    )
+
+    competitions = get_competitions()
+
+    if not competitions:
+        st.error(
+            "No competitions were returned by the API."
+        )
+        return None
+
+    competition_names = [
+        competition["name"]
+        for competition in competitions
+    ]
+
+    selected_name = st.selectbox(
+        "Competition",
+        competition_names,
+        key="competition_selector",
+    )
+
+    selected_competition = next(
+        competition
+        for competition in competitions
+        if competition["name"]
+        == selected_name
+    )
+
+    competition_code = selected_competition[
+        "code"
+    ]
+
+    # --------------------------------------------------------
+    # UPCOMING FIXTURE
+    # --------------------------------------------------------
+
+    if selection_mode == "Upcoming fixture":
+
+        fixtures = get_competition_fixtures(
+            competition_code
+        )
+
+        if not fixtures:
+
+            st.warning(
+                "No upcoming fixtures were available for this competition."
+            )
+
+            return None
+
+        labels = [
+            fixture_label(fixture)
+            for fixture in fixtures
+        ]
+
+        selected_label = st.selectbox(
+            "Fixture",
+            labels,
+            key="fixture_selector",
+        )
+
+        index = labels.index(
+            selected_label
+        )
+
+        return fixtures[index]
+
+    # --------------------------------------------------------
+    # MANUAL TEAMS
+    # --------------------------------------------------------
+
+    teams = get_competition_teams(
+        competition_code
+    )
+
+    if len(teams) < 2:
+
+        st.warning(
+            "Not enough teams were returned for this competition."
+        )
+
+        return None
+
+    team_names = [
+        team["name"]
+        for team in teams
+    ]
+
     col1, col2 = st.columns(2)
-    xg_liv = col1.number_input("Liverpool expected goals", min_value=0.05, max_value=6.0, value=float(auto_xg_liv), step=0.05, key="xg_liv_input")
-    xg_opp = col2.number_input(f"{fixture['opponent']} expected goals", min_value=0.05, max_value=6.0, value=float(auto_xg_opp), step=0.05, key="xg_opp_input")
-    if abs(xg_liv - auto_xg_liv) > 0.001 or abs(xg_opp - auto_xg_opp) > 0.001:
-        st.warning("Manual adjustment active. Model probabilities now use your adjusted figures rather than the automatically calculated values.")
-    st.caption("These are modelled expected-goal estimates, not provider xG. Manual adjustments should only be made when you have specific information not reflected in historical data, such as a major injury or suspension.")
 
-with st.expander("🟨 Match cards estimate — manual input", expanded=False):
-    cards_lambda = st.number_input("Expected total match cards", min_value=0.0, max_value=10.0, value=DEFAULT_CARDS_LAMBDA, step=0.25, key="cards_lambda_input")
-    st.caption("Cards are not currently data-driven. Set this manually using referee tendencies, team discipline and fixture context.")
+    with col1:
+
+        home_name = st.selectbox(
+            "Home team",
+            team_names,
+            key="manual_home_team",
+        )
+
+    with col2:
+
+        away_options = [
+            name
+            for name in team_names
+            if name != home_name
+        ]
+
+        away_name = st.selectbox(
+            "Away team",
+            away_options,
+            key="manual_away_team",
+        )
+
+    home_team = next(
+        team
+        for team in teams
+        if team["name"]
+        == home_name
+    )
+
+    away_team = next(
+        team
+        for team in teams
+        if team["name"]
+        == away_name
+    )
+
+    return {
+        "match_id": None,
+
+        "competition": selected_competition[
+            "name"
+        ],
+
+        "competition_code": competition_code,
+
+        "kickoff": None,
+
+        "home_team_id": home_team[
+            "id"
+        ],
+
+        "home_team_name": home_team[
+            "name"
+        ],
+
+        "away_team_id": away_team[
+            "id"
+        ],
+
+        "away_team_name": away_team[
+            "name"
+        ],
+    }
 
 
 # ============================================================
-# MODEL
+# DASHBOARD
 # ============================================================
 
-model = compute_model(xg_liv, xg_opp)
-cards_over, cards_under = cards_over_under(cards_lambda)
-model["cardsOver"] = cards_over
-model["cardsUnder"] = cards_under
+def render_dashboard(fixture):
 
+    # --------------------------------------------------------
+    # HERO
+    # --------------------------------------------------------
 
-# ============================================================
-# MODEL SNAPSHOT
-# ============================================================
+    kickoff = parse_datetime(
+        fixture.get("kickoff")
+    )
 
-st.divider()
-st.subheader("Model snapshot")
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown(f"""<div class="model-card"><div class="model-card-title">Liverpool expected goals</div><div class="model-card-value">{xg_liv:.2f}</div><div class="model-card-sub">League-relative attack/defence model</div></div>""", unsafe_allow_html=True)
-with c2:
-    st.markdown(f"""<div class="model-card"><div class="model-card-title">{fixture['opponent']} expected goals</div><div class="model-card-value">{xg_opp:.2f}</div><div class="model-card-sub">League-relative attack/defence model</div></div>""", unsafe_allow_html=True)
+    if kickoff:
 
+        now = datetime.now(
+            timezone.utc
+        )
 
-# ============================================================
-# ODDS  (fix #2: collect inputs + placeholders first, compute
-# everything ONCE afterward, then fill in the badges — so the
-# live badge and the summary table below always agree)
-# ============================================================
+        delta = kickoff - now
 
-st.divider()
-st.subheader("Odds & edge")
-st.caption("Enter decimal odds such as 2.10 or fractional odds such as 5/2. Leave blank to skip. Enter all three 1X2 prices to remove the bookmaker's overround for a fairer edge on those markets.")
+        if delta.total_seconds() > 0:
 
-odds_strs = {}
-badge_placeholders = {}
+            total_hours = int(
+                delta.total_seconds()
+                // 3600
+            )
 
-tabs = st.tabs([f"{icon} {name}" for name, icon, _ in MARKET_GROUPS])
+            days = total_hours // 24
+            hours = total_hours % 24
 
-for tab, (group_name, icon, keys) in zip(tabs, MARKET_GROUPS):
-    with tab:
-        if group_name == "Discipline":
-            st.markdown('<div class="warning-box">Cards markets use a manually supplied expected-card estimate. Treat these probabilities as substantially less reliable than the goal model.</div>', unsafe_allow_html=True)
-            st.write("")
-
-        for key in keys:
-            label = LABELS[key]
-            c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
-            c1.markdown(f'<div class="market-card"><span class="market-name">{label}</span><br><span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
-            odds_strs[key] = c2.text_input(f"{label} odds", key=f"odds_{key}", label_visibility="collapsed", placeholder="2.10 or 5/2")
-            badge_placeholders[key] = c3.empty()
-            badge_placeholders[key].markdown('<div style="padding-top:10px"><span class="badge badge-marginal">—</span></div>', unsafe_allow_html=True)
-
-# --- single, unified pass: parse odds, de-vig 1X2, compute verdicts ---
-
-parsed_odds = {}
-for key, odds_str in odds_strs.items():
-    if odds_str:
-        odds = parse_odds(odds_str)
-        if odds is not None:
-            parsed_odds[key] = odds
         else:
-            badge_placeholders[key].markdown('<div style="padding-top:10px;color:#8B948A;font-size:12px;">Invalid odds</div>', unsafe_allow_html=True)
 
-fair_1x2 = calculate_fair_probabilities(parsed_odds, ["home", "draw", "away"])
+            days = None
+            hours = None
 
-results = []
-value_bets = []
+        kickoff_text = kickoff.strftime(
+            "%a %d %b, %H:%M UTC"
+        )
 
-for key, odds in parsed_odds.items():
-    model_probability = model[key]
-    implied = implied_probability(odds)
-    fair_probability = fair_1x2.get(key)
-    comparison_probability = fair_probability if fair_probability is not None else implied
-    edge = model_probability - comparison_probability
-    v = verdict(edge)
+    else:
 
-    cls = {"VALUE": "badge-value", "AVOID": "badge-avoid", "marginal": "badge-marginal"}[v]
-    badge_placeholders[key].markdown(
-        f'<div style="padding-top:10px"><span class="badge {cls}">{edge*100:+.1f}% · {v}</span></div>',
+        days = None
+        hours = None
+
+        kickoff_text = (
+            "Manual match selection"
+        )
+
+    st.markdown(
+        f"""
+<div class="hero">
+
+<div class="hero-title">
+The Boot <span>Room</span>
+</div>
+
+<div class="hero-sub">
+Football probability model · expected goals vs market odds
+</div>
+
+<div class="hero-fixture">
+{fixture["home_team_name"]}
+vs
+{fixture["away_team_name"]}
+</div>
+
+<div class="hero-meta">
+{fixture["competition"]}
+·
+{kickoff_text}
+</div>
+
+</div>
+""",
         unsafe_allow_html=True,
     )
 
-    result = {
-        "key": key, "label": LABELS[key], "model_probability": model_probability,
-        "odds": odds, "implied_probability": implied, "fair_probability": fair_probability,
-        "edge": edge, "verdict": v,
+    if days is not None:
+
+        col1, col2 = st.columns(2)
+
+        col1.metric(
+            "Days to kickoff",
+            days,
+        )
+
+        col2.metric(
+            "Hours remaining",
+            hours,
+        )
+
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
+    with st.spinner(
+        "Building team profiles..."
+    ):
+
+        league = get_league_baselines(
+            fixture[
+                "competition_code"
+            ]
+        )
+
+        home_profile = build_team_profile(
+            fixture[
+                "home_team_id"
+            ],
+            venue="H",
+        )
+
+        away_profile = build_team_profile(
+            fixture[
+                "away_team_id"
+            ],
+            venue="A",
+        )
+
+        auto_home_xg, auto_away_xg, diagnostics = (
+            calculate_match_expected_goals(
+                home_profile,
+                away_profile,
+                league,
+            )
+        )
+
+    # --------------------------------------------------------
+    # XG CONTROLS
+    # --------------------------------------------------------
+
+    with st.expander(
+        "⚽ Estimated goals "
+        "(auto-calculated — click to adjust)",
+        expanded=False,
+    ):
+
+        col1, col2 = st.columns(2)
+
+        home_xg = col1.number_input(
+            f"{fixture['home_team_name']} estimated goals",
+            min_value=0.0,
+            max_value=6.0,
+            value=float(
+                auto_home_xg
+            ),
+            step=0.05,
+            key=(
+                f"xg_home_"
+                f"{fixture['home_team_id']}_"
+                f"{fixture['away_team_id']}"
+            ),
+        )
+
+        away_xg = col2.number_input(
+            f"{fixture['away_team_name']} estimated goals",
+            min_value=0.0,
+            max_value=6.0,
+            value=float(
+                auto_away_xg
+            ),
+            step=0.05,
+            key=(
+                f"xg_away_"
+                f"{fixture['home_team_id']}_"
+                f"{fixture['away_team_id']}"
+            ),
+        )
+
+        st.caption(
+            "The automatic estimate uses recent form, longer-term form, "
+            "venue-specific performance and league-relative regression. "
+            "You can manually adjust for injuries, rotation, tactical changes "
+            "or other information the model cannot see."
+        )
+
+    # --------------------------------------------------------
+    # CARDS
+    # --------------------------------------------------------
+
+    with st.expander(
+        "🟨 Match cards estimate "
+        "(optional manual input)",
+        expanded=False,
+    ):
+
+        cards_lambda = st.number_input(
+            "Expected total match cards",
+            min_value=0.0,
+            max_value=12.0,
+            value=4.0,
+            step=0.25,
+            key=(
+                f"cards_"
+                f"{fixture['home_team_id']}_"
+                f"{fixture['away_team_id']}"
+            ),
+        )
+
+        st.caption(
+            "This market remains manual. "
+            "Consider referee history, league averages, rivalry intensity "
+            "and team disciplinary records."
+        )
+
+    # --------------------------------------------------------
+    # MODEL
+    # --------------------------------------------------------
+
+    model, score_matrix = compute_model(
+        home_xg,
+        away_xg,
+    )
+
+    cards_over, cards_under = (
+        cards_over_under(
+            cards_lambda
+        )
+    )
+
+    model["cardsOver"] = cards_over
+    model["cardsUnder"] = cards_under
+
+    market_labels = {
+        "home": (
+            f"{fixture['home_team_name']} Win"
+        ),
+
+        "draw": "Draw",
+
+        "away": (
+            f"{fixture['away_team_name']} Win"
+        ),
+
+        "over25": (
+            "Over 2.5 Goals"
+        ),
+
+        "under25": (
+            "Under 2.5 Goals"
+        ),
+
+        "bttsY": (
+            "BTTS — Yes"
+        ),
+
+        "bttsN": (
+            "BTTS — No"
+        ),
+
+        "cardsOver": (
+            f"Over {CARDS_THRESHOLD} Match Cards"
+        ),
+
+        "cardsUnder": (
+            f"Under {CARDS_THRESHOLD} Match Cards"
+        ),
     }
-    results.append(result)
-    if v == "VALUE":
-        value_bets.append(result)
 
-if fair_1x2:
-    overround = sum(implied_probability(parsed_odds[k]) for k in ["home", "draw", "away"])
-    st.caption(f"Bookmaker overround on 1X2: {(overround - 1) * 100:.1f}% · edges above use the de-vigged fair-market probability.")
+    # --------------------------------------------------------
+    # MODEL INSPECTOR
+    # --------------------------------------------------------
 
+    with st.expander(
+        "🔬 Model inspector",
+        expanded=False,
+    ):
 
-# ============================================================
-# BEST VALUE
-# ============================================================
+        st.caption(
+            "These are the main inputs used to build the automatic expected-goals estimate."
+        )
 
-if value_bets:
-    best = max(value_bets, key=lambda r: r["edge"])
-    st.markdown(f"""
-<div class="best-value">
-    <div class="best-value-title">Best available value</div>
-    <div class="best-value-market">{best['label']}</div>
-    <div class="best-value-edge">{best['edge']*100:+.1f}% edge &middot; odds {best['odds']:.2f} &middot; model {best['model_probability']*100:.1f}%</div>
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            st.markdown(
+                f"""
+<div class="inspector-card">
+
+<div class="inspector-title">
+{fixture["home_team_name"]} — Home profile
 </div>
-""", unsafe_allow_html=True)
-elif results:
-    st.info(f"No market currently clears the {VALUE_EDGE_THRESHOLD:.0%} VALUE threshold.")
+
+<div class="inspector-row">
+Recent goals scored:
+{home_profile["recent"]["scored"] if home_profile["recent"]["scored"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Recent goals conceded:
+{home_profile["recent"]["conceded"] if home_profile["recent"]["conceded"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Long-term goals scored:
+{home_profile["long_term"]["scored"] if home_profile["long_term"]["scored"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Long-term goals conceded:
+{home_profile["long_term"]["conceded"] if home_profile["long_term"]["conceded"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Attack strength:
+{diagnostics["home_attack_strength"]:.2f}
+</div>
+
+<div class="inspector-row">
+Defensive weakness:
+{diagnostics["home_defence_weakness"]:.2f}
+</div>
+
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+        with col2:
+
+            st.markdown(
+                f"""
+<div class="inspector-card">
+
+<div class="inspector-title">
+{fixture["away_team_name"]} — Away profile
+</div>
+
+<div class="inspector-row">
+Recent goals scored:
+{away_profile["recent"]["scored"] if away_profile["recent"]["scored"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Recent goals conceded:
+{away_profile["recent"]["conceded"] if away_profile["recent"]["conceded"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Long-term goals scored:
+{away_profile["long_term"]["scored"] if away_profile["long_term"]["scored"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Long-term goals conceded:
+{away_profile["long_term"]["conceded"] if away_profile["long_term"]["conceded"] is not None else "N/A"}
+</div>
+
+<div class="inspector-row">
+Attack strength:
+{diagnostics["away_attack_strength"]:.2f}
+</div>
+
+<div class="inspector-row">
+Defensive weakness:
+{diagnostics["away_defence_weakness"]:.2f}
+</div>
+
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+        st.markdown(
+            f"""
+<div class="inspector-card">
+
+<div class="inspector-title">
+League baseline
+</div>
+
+<div class="inspector-row">
+Average home goals:
+{league["home_goals"]:.2f}
+</div>
+
+<div class="inspector-row">
+Average away goals:
+{league["away_goals"]:.2f}
+</div>
+
+<div class="inspector-row">
+Finished matches sampled:
+{league["matches"]}
+</div>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    # --------------------------------------------------------
+    # SCORE PROBABILITIES
+    # --------------------------------------------------------
+
+    with st.expander(
+        "📊 Most likely scores",
+        expanded=False,
+    ):
+
+        top_scores = sorted(
+            score_matrix.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )[:8]
+
+        columns = st.columns(4)
+
+        for index, (
+            score,
+            probability,
+        ) in enumerate(top_scores):
+
+            home_goals, away_goals = score
+
+            columns[
+                index % 4
+            ].metric(
+                f"{home_goals}–{away_goals}",
+                f"{probability * 100:.1f}%",
+            )
+
+    # --------------------------------------------------------
+    # ODDS
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Odds & edge"
+    )
+
+    st.caption(
+        "Enter decimal odds such as 2.10 or fractional odds such as 5/2. "
+        "For the 1X2 market, entering all three prices automatically removes "
+        "the bookmaker margin before calculating the edge."
+    )
+
+    odds_inputs = {}
+
+    # 1X2 first so we can devig.
+
+    result_keys = [
+        "home",
+        "draw",
+        "away",
+    ]
+
+    st.markdown(
+        "### 🥅 Match Result"
+    )
+
+    for key in result_keys:
+
+        c1, c2, c3 = st.columns(
+            [2.2, 1.3, 1.6]
+        )
+
+        label = market_labels[key]
+
+        c1.markdown(
+            f"""
+<div class="market-card">
+
+<span class="market-name">
+{label}
+</span>
+
+<br>
+
+<span class="model-pct">
+Model: {model[key] * 100:.1f}%
+</span>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        odds_text = c2.text_input(
+            f"{label} odds",
+            key=(
+                f"odds_{key}_"
+                f"{fixture['home_team_id']}_"
+                f"{fixture['away_team_id']}"
+            ),
+            label_visibility="collapsed",
+            placeholder="2.10 or 5/2",
+        )
+
+        odds = parse_odds(
+            odds_text
+        )
+
+        odds_inputs[key] = odds
+
+        c3.markdown(
+            """
+<div style="padding-top:10px">
+<span class="badge badge-marginal">
+—
+</span>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+    devig_probs = fair_probabilities_from_market(
+        odds_inputs
+    )
+
+    # Display corrected result badges.
+
+    for key in result_keys:
+
+        odds = odds_inputs.get(
+            key
+        )
+
+        if odds is None:
+            continue
+
+        if devig_probs:
+
+            market_prob = devig_probs[
+                key
+            ]
+
+        else:
+
+            market_prob = implied_probability(
+                odds
+            )
+
+        edge = (
+            model[key]
+            - market_prob
+        )
+
+        odds_inputs[key] = {
+            "odds": odds,
+            "market_probability": market_prob,
+            "edge": edge,
+            "verdict": verdict(edge),
+        }
+
+    # --------------------------------------------------------
+    # OTHER MARKETS
+    # --------------------------------------------------------
+
+    other_groups = [
+        (
+            "⚽ Goals",
+            ["over25", "under25"],
+        ),
+
+        (
+            "🎯 Both Teams to Score",
+            ["bttsY", "bttsN"],
+        ),
+
+        (
+            "🟨 Discipline",
+            ["cardsOver", "cardsUnder"],
+        ),
+    ]
+
+    results = []
+
+    # Add result markets.
+
+    st.divider()
+
+    st.subheader(
+        "Match result edge"
+    )
+
+    for key in result_keys:
+
+        data = odds_inputs.get(
+            key
+        )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+            continue
+
+        edge = data["edge"]
+        verdict_name = data["verdict"]
+
+        c1, c2, c3 = st.columns(
+            [2.2, 1.3, 1.6]
+        )
+
+        c1.markdown(
+            f"""
+<div class="market-card">
+
+<span class="market-name">
+{market_labels[key]}
+</span>
+
+<br>
+
+<span class="model-pct">
+Model: {model[key] * 100:.1f}%
+</span>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        c2.metric(
+            "Odds",
+            f"{data['odds']:.2f}",
+        )
+
+        c3.markdown(
+            f"""
+<div style="padding-top:10px">
+
+<span class="badge {verdict_class(verdict_name)}">
+{edge * 100:+.1f}% · {verdict_name}
+</span>
+
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+
+        results.append(
+            {
+                "key": key,
+
+                "label": market_labels[
+                    key
+                ],
+
+                "model_probability": model[
+                    key
+                ],
+
+                "odds": data[
+                    "odds"
+                ],
+
+                "market_probability": data[
+                    "market_probability"
+                ],
+
+                "edge": edge,
+
+                "verdict": verdict_name,
+            }
+        )
+
+    # --------------------------------------------------------
+    # OTHER MARKET INPUTS
+    # --------------------------------------------------------
+
+    for (
+        group_name,
+        keys,
+    ) in other_groups:
+
+        st.divider()
+
+        st.subheader(
+            group_name
+        )
+
+        for key in keys:
+
+            c1, c2, c3 = st.columns(
+                [2.2, 1.3, 1.6]
+            )
+
+            label = market_labels[key]
+
+            c1.markdown(
+                f"""
+<div class="market-card">
+
+<span class="market-name">
+{label}
+</span>
+
+<br>
+
+<span class="model-pct">
+Model: {model[key] * 100:.1f}%
+</span>
+
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+            odds_text = c2.text_input(
+                f"{label} odds",
+                key=(
+                    f"odds_{key}_"
+                    f"{fixture['home_team_id']}_"
+                    f"{fixture['away_team_id']}"
+                ),
+                label_visibility="collapsed",
+                placeholder="2.10 or 5/2",
+            )
+
+            odds = parse_odds(
+                odds_text
+            )
+
+            if odds is None:
+
+                c3.markdown(
+                    """
+<div style="padding-top:10px">
+<span class="badge badge-marginal">
+—
+</span>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
+
+                continue
+
+            market_prob = implied_probability(
+                odds
+            )
+
+            edge = (
+                model[key]
+                - market_prob
+            )
+
+            verdict_name = verdict(
+                edge
+            )
+
+            c3.markdown(
+                f"""
+<div style="padding-top:10px">
+
+<span class="badge {verdict_class(verdict_name)}">
+{edge * 100:+.1f}% · {verdict_name}
+</span>
+
+</div>
+""",
+                unsafe_allow_html=True,
+            )
+
+            results.append(
+                {
+                    "key": key,
+
+                    "label": label,
+
+                    "model_probability": model[
+                        key
+                    ],
+
+                    "odds": odds,
+
+                    "market_probability": market_prob,
+
+                    "edge": edge,
+
+                    "verdict": verdict_name,
+                }
+            )
+
+    # --------------------------------------------------------
+    # BEST VALUE
+    # --------------------------------------------------------
+
+    value_bets = [
+        result
+        for result in results
+        if result["verdict"]
+        == "VALUE"
+    ]
+
+    if value_bets:
+
+        best = max(
+            value_bets,
+            key=lambda x: x["edge"],
+        )
+
+        st.success(
+            f"Best model edge found: "
+            f"**{best['label']}** "
+            f"— {best['edge'] * 100:+.1f}% edge "
+            f"at odds {best['odds']:.2f}"
+        )
+
+    elif results:
+
+        st.info(
+            "No market currently reaches the model's VALUE threshold."
+        )
+
+    # --------------------------------------------------------
+    # COPY SUMMARY
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.subheader(
+        "Copy this analysis"
+    )
+
+    if results:
+
+        lines = [
+            "\t".join(
+                SUMMARY_HEADER
+            )
+        ]
+
+        for result in results:
+
+            row = build_summary_row(
+                fixture=fixture,
+
+                home_xg=home_xg,
+
+                away_xg=away_xg,
+
+                market_label=result[
+                    "label"
+                ],
+
+                model_probability=result[
+                    "model_probability"
+                ],
+
+                odds=result[
+                    "odds"
+                ],
+
+                market_probability=result[
+                    "market_probability"
+                ],
+
+                edge=result[
+                    "edge"
+                ],
+
+                verdict_name=result[
+                    "verdict"
+                ],
+            )
+
+            lines.append(
+                "\t".join(
+                    str(value)
+                    for value in row
+                )
+            )
+
+        summary = "\n".join(
+            lines
+        )
+
+        st.caption(
+            "Use the copy icon in the top-right of the box and paste into "
+            "Excel, Google Sheets or another tracker."
+        )
+
+        st.code(
+            summary,
+            language=None,
+        )
+
+    else:
+
+        st.caption(
+            "Enter odds for one or more markets to generate a copyable summary."
+        )
+
+    # --------------------------------------------------------
+    # DISCLAIMER
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.caption(
+        "The Boot Room estimates probabilities from historical scoring data "
+        "and manually adjustable assumptions. It is not a guarantee of future "
+        "results. A positive model edge can still lose, and bookmaker prices "
+        "may contain information this model does not capture. Bet only what "
+        "you can afford to lose."
+    )
 
 
 # ============================================================
-# MARKET DETAIL
+# MAIN
 # ============================================================
 
-if results:
-    st.subheader("Market detail")
-    display_rows = [{
-        "Market": r["label"],
-        "Model": f"{r['model_probability']*100:.1f}%",
-        "Odds": f"{r['odds']:.2f}",
-        "Implied": f"{r['implied_probability']*100:.1f}%",
-        "Fair market": f"{r['fair_probability']*100:.1f}%" if r["fair_probability"] is not None else "—",
-        "Edge": f"{r['edge']*100:+.1f}%",
-        "Verdict": r["verdict"],
-    } for r in results]
-    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+if not API_KEY:
 
+    st.error(
+        "FOOTBALL_DATA_KEY isn't set."
+    )
 
-# ============================================================
-# COPY SUMMARY
-# ============================================================
+    st.markdown(
+        """
+### Local development
 
-st.divider()
-st.subheader("Copy this week's summary")
+Set:
 
-if results:
-    lines = ["\t".join(SUMMARY_HEADER)]
-    for r in results:
-        row = build_summary_row(fixture, xg_liv, xg_opp, r["label"], r["model_probability"], r["odds"], r["edge"], r["verdict"])
-        lines.append("\t".join(str(v) for v in row))
-    summary_text = "\n".join(lines)
-
-    st.caption("Click the copy icon in the top-right of the box below, then paste into your tracker spreadsheet — tab-separated, so it lands in the right columns.")
-    st.code(summary_text, language=None)
-else:
-    st.caption("Enter at least one price above and it will appear here, ready to copy.")
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-st.caption(
-    "The Boot Room uses a simplified league-relative Poisson model. Expected goals are model estimates, "
-    "not provider xG, and don't fully account for injuries, line-ups, tactical changes, transfers, fixture "
-    "congestion, or other qualitative information. Cards are manually estimated. Model edge is an estimate, "
-    "not a guarantee of value or profit. No model beats a well-priced market consistently. Bet only what "
-    "you can afford to lose."
-)
+```bash
+export FOOTBALL_DATA_KEY="your_key_here"
