@@ -609,22 +609,17 @@ def render_dashboard(fixture):
     st.divider()
     st.subheader("Odds & Edge")
 
+    all_market_keys = ["home", "draw", "away", "over25", "under25", "bttsY", "bttsN", "cardsOver", "cardsUnder"]
+
+    # Pre-pull existing inputs from session state to evaluate de-vig probabilities cleanly
     odds_inputs = {}
     for key in ["home", "draw", "away"]:
-        c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
-        c1.markdown(f'<div class="market-card"><span class="market-name">{market_labels[key]}</span><br><span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
-        odds_text = c2.text_input(f"{key} odds", key=f"odds_{key}_{fixture['home_team_id']}", label_visibility="collapsed", placeholder="2.10")
-        odds_inputs[key] = parse_odds(odds_text)
+        widget_key = f"odds_{key}_{fixture['home_team_id']}"
+        odds_inputs[key] = parse_odds(st.session_state.get(widget_key, ""))
 
     devig_probs = fair_probabilities_from_market(odds_inputs)
     results = []
-    all_market_keys = ["home", "draw", "away", "over25", "under25", "bttsY", "bttsN", "cardsOver", "cardsUnder"]
 
-    # Re-render UI cleanly with feedback loops
-    # Clear out previous placeholder render and perform the unified loop logic cleanly:
-    st.empty()
-    
-    # Let's iterate through all markets directly with live evaluation:
     for key in all_market_keys:
         c1, c2, c3 = st.columns([2.2, 1.3, 1.6])
         c1.markdown(f'<div class="market-card"><span class="market-name">{market_labels[key]}</span><br><span class="model-pct">Model: {model[key]*100:.1f}%</span></div>', unsafe_allow_html=True)
